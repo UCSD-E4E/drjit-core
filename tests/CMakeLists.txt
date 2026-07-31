@@ -57,6 +57,29 @@ if (DRJIT_ENABLE_METAL)
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+if (DRJIT_ENABLE_HIP)
+  # Phase 0a invariants: the backend is registered but inert, and adding it
+  # perturbs nothing else. Expected to pass from the moment the wiring lands.
+  add_executable(hip_wiring hip_wiring.cpp)
+  set_property(TARGET hip_wiring PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_wiring PRIVATE drjit-core)
+  add_test(NAME hip_wiring COMMAND hip_wiring
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
+  # Phase 2 acceptance gate, written before the implementation.
+  #
+  # WILL_FAIL keeps ctest green while codegen is unimplemented. When Phase 2
+  # starts working this test passes, WILL_FAIL then reports it as a FAILURE,
+  # and that red is the signal to delete the property below. Do not remove it
+  # earlier, and do not weaken the test to make it pass.
+  add_executable(hip_codegen hip_codegen.cpp)
+  set_property(TARGET hip_codegen PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_codegen PRIVATE drjit-core)
+  add_test(NAME hip_codegen COMMAND hip_codegen
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  set_tests_properties(hip_codegen PROPERTIES WILL_FAIL TRUE)
+endif()
+
 add_executable(microbenchmark microbenchmark.cpp)
 set_property(TARGET microbenchmark PROPERTY CXX_STANDARD 17)
 target_link_libraries(microbenchmark PRIVATE drjit-core)

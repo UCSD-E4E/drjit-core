@@ -201,7 +201,42 @@ matter — this is the §3.1 debuggability argument in practice.
 
 ---
 
-## 11. Suggested implementation order
+## 11. Working discipline — test first
+
+Every change from here is test-driven. Concretely:
+
+**Write the assertion before the implementation.** `tests/hip_codegen.cpp` was
+written before any codegen exists and currently exits 1. It is registered with
+`WILL_FAIL TRUE` so `ctest` stays green while Phase 2 is incomplete — and turns
+**red the moment codegen starts working**, which is the signal to delete that
+property. Do not weaken the test to make it pass.
+
+**Two loops, different speeds.**
+
+| Loop | Command | Needs | Use for |
+|---|---|---|---|
+| Fast | `tools/hip_validate/run_tests.sh ./build-hip/hip_validate` | nothing (no AMD GPU) | every opcode, every edit |
+| Acceptance | `ctest -R hip_` from `build-*/tests` | MI210 for the codegen test | declaring a phase done |
+
+The fast loop compiles each kernel for **real gfx90a** and **executes** it on the
+local NVIDIA GPU. Per opcode brought up in `hip_eval.cpp`:
+
+1. Add a kernel under `tools/hip_validate/kernels/` exercising it, plus an
+   assertion in `tests/hip_codegen.cpp`.
+2. Run the fast loop — watch it fail.
+3. Implement the opcode.
+4. Run again — green.
+
+**Negative tests are load-bearing.** `kernels/broken_syntax.hip` must FAIL. The
+runner treats a `broken_*` kernel that passes as an error, because a harness
+that has silently stopped detecting errors makes every other result worthless.
+Keep at least one negative case as coverage grows.
+
+**Phase 0a was not done this way** — the wiring was written first and verified
+with a throwaway program. `tests/hip_wiring.cpp` retrofits those invariants so
+they are at least permanent and repeatable. Do not repeat that pattern.
+
+## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
    with `hip_validate` (both arms) from the first commit.
