@@ -103,6 +103,15 @@ int jit_has_backend(JitBackend backend) {
 #endif
             break;
 
+        case JitBackend::HIP:
+#if defined(DRJIT_ENABLE_HIP)
+            result = (state.backends & (1u << (uint32_t) JitBackend::HIP))
+                && !state.hip_devices.empty();
+#else
+            result = false;
+#endif
+            break;
+
         default:
             jitc_raise("jit_has_backend(): invalid input!");
     }

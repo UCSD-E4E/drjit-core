@@ -15,6 +15,9 @@
 #if defined(DRJIT_ENABLE_METAL)
 #  include "metal.h"
 #endif
+#if defined(DRJIT_ENABLE_HIP)
+#  include "hip.h"
+#endif
 #include "llvm_ts.h"
 #include "malloc.h"
 #include "internal.h"
@@ -141,6 +144,11 @@ void jitc_init(uint32_t backends) {
 #if defined(DRJIT_ENABLE_METAL)
     if ((backends & (1u << (uint32_t) JitBackend::Metal)) && jitc_metal_init())
         state.backends |= 1u << (uint32_t) JitBackend::Metal;
+#endif
+
+#if defined(DRJIT_ENABLE_HIP)
+    if ((backends & (1u << (uint32_t) JitBackend::HIP)) && jitc_hip_init())
+        state.backends |= 1u << (uint32_t) JitBackend::HIP;
 #endif
 
     state.variable_counter = 0;
@@ -362,6 +370,9 @@ void jitc_shutdown(int light) {
 #endif
 #if defined(DRJIT_ENABLE_METAL)
         jitc_metal_shutdown();
+#endif
+#if defined(DRJIT_ENABLE_HIP)
+        jitc_hip_shutdown();
 #endif
     }
 

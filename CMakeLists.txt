@@ -27,6 +27,13 @@ if (APPLE)
   option(DRJIT_ENABLE_METAL "Enable the Apple Metal backend?" ON)
 endif()
 
+if (NOT APPLE)
+  # AMD ROCm/HIP backend (PLAN.md). Default OFF while it is under construction:
+  # Phase 0a registers the backend but leaves it inert.
+  option(DRJIT_ENABLE_HIP  "Enable the AMD HIP backend?" OFF)
+  option(DRJIT_DYNAMIC_HIP "Resolve HIP dynamically at run time?" ON)
+endif()
+
 if (NOT MSVC)
   option(DRJIT_SANITIZE_UBSAN   "Enable the address sanitizer (GCC, Clang)" OFF)
   option(DRJIT_SANITIZE_ASAN    "Enable the undefined behavior sanitizer (GCC, Clang)" OFF)
@@ -169,6 +176,13 @@ if (DRJIT_ENABLE_METAL)
     src/metal_coop_vec.cpp)
 endif()
 
+if (DRJIT_ENABLE_HIP)
+  set(DRJIT_HIP_FILES
+    src/hip.h
+    src/hip_core.cpp
+    src/hip_eval.cpp)
+endif()
+
 
 add_library(
   drjit-core SHARED
@@ -203,6 +217,9 @@ add_library(
 
   # Metal backend, if enabled
   ${DRJIT_METAL_FILES}
+
+  # HIP backend, if enabled
+  ${DRJIT_HIP_FILES}
 
   # LLVM backend
   src/llvm_api.h
@@ -342,6 +359,13 @@ endif()
 
 if (DRJIT_ENABLE_CUDA)
   target_compile_definitions(drjit-core PRIVATE -DDRJIT_ENABLE_CUDA=1)
+endif()
+
+if (DRJIT_ENABLE_HIP)
+  target_compile_definitions(drjit-core PRIVATE -DDRJIT_ENABLE_HIP=1)
+  if (DRJIT_DYNAMIC_HIP)
+    target_compile_definitions(drjit-core PRIVATE -DDRJIT_DYNAMIC_HIP=1)
+  endif()
 endif()
 
 if (DRJIT_ENABLE_METAL)

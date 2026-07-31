@@ -48,3 +48,5 @@ tests/microbenchmark
 /resources/kernels_75.ptx
 /resources/metal_kernels.air
 build-hip/
+build-wiring/
+build-off/

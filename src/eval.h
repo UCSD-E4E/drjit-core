@@ -170,6 +170,22 @@ extern const char *jitc_metal_format(size_t *size_out = nullptr);
 extern int metal_vft_arg_index;
 #endif
 
+#if defined(DRJIT_ENABLE_HIP)
+/// Used by jitc_eval() to generate HIP C++ source. Declared here rather than in
+/// hip_eval.h for the same reason as the Metal entry point above: eval.cpp must
+/// not pull in that header's codegen macros.
+extern void jitc_hip_assemble(ThreadState *ts, ScheduledGroup group,
+                              uint32_t n_regs, uint32_t n_params);
+
+/// Reset per-kernel HIP assembly state at the start of jitc_eval()
+extern void jitc_hip_assemble_reset();
+
+/// Indented copy of the assembled HIP source for PrintIR / high log levels.
+/// Mirrors jitc_metal_format(); codegen emits unformatted text because
+/// indentation tracking is costly.
+extern const char *jitc_hip_format(size_t *size_out = nullptr);
+#endif
+
 /// Register a global declaration that will be included in the final program
 extern void jitc_register_global(const char *str,
                                  GlobalType type = GlobalType::Global);

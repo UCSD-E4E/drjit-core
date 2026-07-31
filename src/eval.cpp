@@ -596,6 +596,11 @@ void jitc_assemble(ThreadState *ts, ScheduledGroup group) {
         jitc_metal_assemble(ts, group, n_regs, (uint32_t) kernel_params.size());
     else
 #endif
+#if defined(DRJIT_ENABLE_HIP)
+    if (jitc_is_hip(backend))
+        jitc_hip_assemble(ts, group, n_regs, (uint32_t) kernel_params.size());
+    else
+#endif
         jitc_llvm_assemble(ts, group);
 
     // Bind the call-data buffer (built by jitc_call_upload() above and stored in

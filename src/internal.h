@@ -739,6 +739,39 @@ struct MetalDevice {
 };
 #endif
 
+#if defined(DRJIT_ENABLE_HIP)
+/// A single AMD GPU reachable through the HIP runtime.
+///
+/// Deliberately mirrors CUDADevice rather than MetalDevice: the HIP driver API
+/// is a near 1:1 analogue of the CUDA driver API, so this struct and the
+/// runtime layer built on it port mechanically (PLAN.md §4).
+struct HIPDevice {
+    /// hipDevice_t ordinal
+    int id;
+
+    /// hipCtx_t (opaque; HIP driver types stay out of shared headers)
+    void *context;
+
+    /// Target ISA, e.g. "gfx90a". Fixed per device, read at init and used to
+    /// key the kernel cache and drive codegen.
+    char arch[32];
+
+    /// Wavefront width reported by the device: 64 on CDNA/GCN, 32 on RDNA.
+    ///
+    /// This is §3.3's single-definition parameter. Codegen must read it from
+    /// here rather than hardcoding 64 -- HIP-RT follows the same convention
+    /// (hiprt_common.h defines WarpSize as an arch-varying constexpr), and a
+    /// hardcoded width silently miscomputes on a warp-32 test platform.
+    uint32_t warp_size;
+
+    /// Total device memory in bytes
+    size_t memory_total;
+
+    /// Cached human-readable device name (owned, freed at shutdown)
+    char *name;
+};
+#endif
+
 /// Represents a single stream of a parallel communication
 struct ThreadStateBase {
     /// Backend type
@@ -1135,6 +1168,11 @@ struct State {
     std::vector<MetalDevice> metal_devices;
 #endif
 
+#if defined(DRJIT_ENABLE_HIP)
+    /// Available HIP devices (AMD GPUs via ROCm)
+    std::vector<HIPDevice> hip_devices;
+#endif
+
     /// State associated with each DrJit thread
     std::vector<ThreadState *> tss;
 
@@ -1336,13 +1374,21 @@ template <typename T> inline bool jitc_is_metal(T b) {
 #endif
 }
 
+template <typename T> inline bool jitc_is_hip(T b) {
+#if defined(DRJIT_ENABLE_HIP)
+    return (JitBackend) b == JitBackend::HIP;
+#else
+    (void) b; return false;
+#endif
+}
+
 template <typename T> inline bool jitc_is_llvm(T b) {
     return (JitBackend) b == JitBackend::LLVM;
 }
 
-/// Returns true if the given backend uses GPU device memory (CUDA or Metal)
+/// Returns true if the given backend uses GPU device memory (CUDA, Metal or HIP)
 template <typename T> inline bool jitc_is_gpu(T b) {
-    return jitc_is_cuda(b) || jitc_is_metal(b);
+    return jitc_is_cuda(b) || jitc_is_metal(b) || jitc_is_hip(b);
 }
 
 /// Search for a shared library and dlopen it if possible
