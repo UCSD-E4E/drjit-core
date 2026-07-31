@@ -1,0 +1,217 @@
+# hip_eval.cpp blueprint — notes from reading the Metal backend
+
+Output of the §10 task "read `metal_eval.cpp`, `metal.h` and `scene_metal.inl`
+end to end before writing any HIP code". These are the structural decisions the
+Metal backend already made, and what each one maps to for HIP.
+
+Metal is the reference throughout, **not** CUDA/OptiX — it is the only backend in
+this tree that emits *source text* and integrates ray tracing inline, which is
+exactly the shape `hip_eval.cpp` needs (PLAN.md §3.1, §3.2).
+
+---
+
+## 1. Entry point and skeleton
+
+`jitc_metal_assemble(ThreadState*, ScheduledGroup, n_regs, n_params)` is called
+from the dispatch chain in `eval.cpp:589-599`. `jitc_hip_assemble` slots in
+alongside, guarded by `DRJIT_ENABLE_HIP`. That plus the enum entry is most of
+the upstream seam (§9).
+
+Emission order, from `jitc_metal_assemble`:
+
+1. Preamble — `#include <metal_stdlib>`, `using namespace metal;`
+2. `struct Params { uint size; device void *args[N]; }`
+3. Kernel signature with a **literal `^^^^...` placeholder** for the name
+4. Call-data base pointer, if the kernel has calls
+5. The variable loop (§3 below)
+6. Closing brace, then scene configuration comment
+7. Callable bodies, then forward declarations moved *before* the kernel
+
+The `^^^^` run is not decoration: `eval.cpp:607-625` replaces it in-place with
+the kernel hash after assembly. Emit the same placeholder width.
+
+**HIP mapping.** Preamble becomes the prelude contract in `prelude_hip.h`. The
+kernel becomes `extern "C" __global__ void drjit_^^^^(Params params)`, and
+`thread_position_in_grid` becomes `blockIdx.x * blockDim.x + threadIdx.x`. HIP
+takes struct kernel parameters by value, so `Params` can pass directly rather
+than through a buffer binding.
+
+---
+
+## 2. The `fmt` mini-language
+
+Shared with `cuda_eval.cpp`; documented at the top of both files.
+
+| Code | Meaning |
+|---|---|
+| `$u` | uint32 |
+| `$s` | C string |
+| `$t` | variable type |
+| `$b` | variable type, binary/bit-pattern form |
+| `$v` | variable name (`r1234`) |
+| `$l` | literal value |
+| `$o` | index into `params.args[]` |
+
+Reuse verbatim. The `$o` convention is off-by-one against the parameter index
+because of the leading `size` field — see the comment at `metal_eval.cpp:278`.
+
+---
+
+## 3. The variable loop
+
+For each `schedule[gi]` in the group:
+
+- `ParamType::Input` + literal → materialise inline (`as_type<float>` for f32,
+  `as_type<half>` for f16, plain cast otherwise).
+  **Pointer literals are deliberately loaded from `params.args[]`, not inlined**,
+  so frozen-function replay can rebind the address. Preserve this or `@dr.freeze`
+  breaks (§Phase 6).
+- `ParamType::Input`, non-literal → `((device const T*) params.args[$o])[r0]`
+  when `size > 1`, else a scalar dereference.
+- Otherwise → `jitc_metal_render(v)`, then if `ParamType::Output`, store to
+  `((device T*) params.args[$o])[r0]`.
+
+Arrays take a separate path via `render_array_memcpy_in/out` against a named
+`p<reg>` pointer.
+
+---
+
+## 4. FP64 — a real divergence
+
+```c
+if ((VarType) v->type == VarType::Float64)
+    jitc_fail("... the program should not contain Float64 variables.");
+```
+
+Apple GPUs have no FP64, so Dr.Jit promotes `Float64`→`Float32` at variable
+creation and codegen treats arrival as a bug.
+
+**Do not copy this.** `gfx90a` has *full-rate* FP64 — one of the MI210's headline
+capabilities. HIP emits `double` natively and must not inherit the promotion.
+This is the one place the Metal template is actively wrong for us.
+
+---
+
+## 5. Opcode rendering
+
+Three helpers cover most of the surface:
+
+```c
+render_unary (v, op)          ->  T v = op(a);
+render_binary(v, op)          ->  T v = a op b;
+render_call  (v, fn, n_args)  ->  T v = fn(a0, a1, a2);
+render_round (v, fn)          ->  rounding, optionally fused with a float->int cast
+```
+
+then a `switch ((VarKind) v->kind)`. §0.2 measured **54 distinct opcodes** in the
+simplest possible Mitsuba scene — that is the floor for coverage, and a useful
+ordering hint: the measured frequency was `mov` 390, `mul` 145, `ld` 129,
+`fma` 104, `add` 89, `st` 62, `setp` 61, `selp` 59. Bring those up first.
+
+---
+
+## 6. Resource handles — simpler for HIP
+
+`jitc_metal_render_resource_handle` reconstructs a typed reference from an opaque
+`gpuResourceID` for textures, samplers, acceleration structures and intersection
+function tables, because MSL resource types are opaque and cannot be cast from an
+integer.
+
+**HIP is materially simpler here.** `hipTextureObject_t` is an ordinary 64-bit
+handle and HIP-RT scene handles are plain pointers, so most of this collapses to
+a normal pointer load. Expect `jitc_hip_render_resource_handle` to be a fraction
+of Metal's size.
+
+---
+
+## 7. Ray tracing — the direct template
+
+`VarKind::TraceRay` at `metal_eval.cpp:917-1031`. Shape:
+
+1. Declare 8 outputs, pre-set to **miss** values — `hit=false`,
+   `t=+inf` (`as_type<float>(0x7f800000u)`), rest zero. Masked and missed lanes
+   then simply fall through with correct values.
+2. `if ($v) {` when the mask is not the literal `1`, else a bare block.
+3. Read the 8 ray parameters from `td->indices[0..7]`
+   (origin xyz, direction xyz, tmin, tmax).
+4. Configure the intersector from `scene->geometry_types_mask`.
+5. Build the ray, call `intersect`.
+6. On hit, overwrite the outputs.
+
+Only outputs 1–7 are computed when `td->shadow` is unset; shadow rays write the
+hit flag alone.
+
+`geometry_types_mask` bits: `0` triangle, `1` bounding_box, `2` curves,
+`3` backface-culled triangles. These map 1:1 onto Mitsuba's `ShapeIR::Kind`
+(`include/mitsuba/render/scene_ir.h`), which is why the Mitsuba-side port is
+cheap (§2 Layer C).
+
+**HIP mapping.** `raytracing::intersector<...>` becomes a `hiprtGeomTraversal*` /
+`hiprtSceneTraversal*` object, `_hit` becomes `hiprtHit`, and the IFT becomes a
+`hiprtFuncTable`. The 8-output contract, the miss-value trick and the mask
+handling all carry over unchanged — that contract is `jit_metal_ray_trace`'s
+signature and should become `jit_hip_ray_trace` verbatim.
+
+Contrast with OptiX, whose `_optix_hitobject_traverse` call takes ~50 arguments
+(§0.2). Mirroring Metal here avoids roughly an order of magnitude of interface.
+
+---
+
+## 8. Scene discovery happens *during* codegen
+
+`metal_kernel_scenes` is appended to by `metal_register_kernel_scene()` as
+`TraceRay` nodes are rendered — there is no separate pre-walk. The list is then
+consumed at compile time to link intersection functions into the pipeline.
+
+`jitc_metal_render_scene_configuration()` emits the scene's properties as a
+**comment**. That is not documentation: intersection functions and geometry types
+affect pipeline linking but are otherwise invisible in the MSL, so folding them
+into the source text ensures incompatible configurations hash to different
+kernels. **HIP needs the same trick** or the disk cache will serve a kernel built
+against the wrong function table.
+
+---
+
+## 9. Callables and ordering
+
+Callable bodies are emitted *after* the kernel, then forward declarations (plus
+`GlobalType::Global` bodies in full) are moved before it with
+`buffer.move_suffix`. Only single-target callables need declarations —
+multi-target ones are reached through the function table and never named.
+
+HIP C++ has the same declare-before-use requirement, so this machinery ports
+directly.
+
+---
+
+## 10. Formatting pass — copy wholesale
+
+`jitc_metal_format()` (~80 lines) generates *unformatted* source during codegen —
+indentation tracking is costly — and reindents only when `JitFlag.PrintIR` or a
+high log level is set.
+
+It relies on three properties of the emitted text: braces only ever denote
+control flow, comments are `//` only, and no statement is split across a blank or
+comment line. Emitted HIP satisfies all three, so this is directly reusable and
+worth taking as-is. Violating the properties degrades indentation but never
+semantics.
+
+Given §0.2 measured a 2039-line kernel for the *simplest* scene, readable dumps
+matter — this is the §3.1 debuggability argument in practice.
+
+---
+
+## 11. Suggested implementation order
+
+1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
+   with `hip_validate` (both arms) from the first commit.
+2. Compare/select, then memory (gather/scatter).
+3. Control flow — loops and `if`. Cross-check against `VarKind::CondStart`
+   handling near `metal_eval.cpp:850-914`.
+4. Calls and callables, including the forward-declaration move.
+5. `TraceRay` against HIP-RT.
+6. Textures, arrays, packet memory.
+
+Steps 1–4 are fully verifiable on the local NVIDIA box. Step 5 needs the MI210.
+Anything touching wave-width semantics goes on the wave64-unverified list
+(§0.3, §7.2) regardless of which step introduces it.
