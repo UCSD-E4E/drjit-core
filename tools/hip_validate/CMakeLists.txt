@@ -28,6 +28,10 @@ target_compile_definitions(hip_validate PRIVATE
 
 target_link_libraries(hip_validate PRIVATE ${CMAKE_DL_LIBS})
 
+# Emits the generated prologue so run_tests.sh can compile it for real gfx90a.
+# tests/hip_prologue.cpp checks the shape; this checks it is valid HIP.
+add_executable(gen_prologue gen_prologue.cpp)
+
 if (CMAKE_CXX_COMPILER_ID MATCHES "(GNU|Clang)")
   target_compile_options(hip_validate PRIVATE -Wall -Wextra)
 endif()

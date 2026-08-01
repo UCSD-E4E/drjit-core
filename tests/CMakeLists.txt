@@ -65,6 +65,13 @@ if (DRJIT_ENABLE_HIP)
   add_test(NAME hip_types COMMAND hip_types
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
+  # Kernel prologue. Pure, no device needed.
+  add_executable(hip_prologue hip_prologue.cpp)
+  set_property(TARGET hip_prologue PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_prologue PRIVATE drjit-core)
+  add_test(NAME hip_prologue COMMAND hip_prologue
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
   # Literal materialisation. Pure, no device needed.
   add_executable(hip_literal hip_literal.cpp)
   set_property(TARGET hip_literal PROPERTY CXX_STANDARD 17)

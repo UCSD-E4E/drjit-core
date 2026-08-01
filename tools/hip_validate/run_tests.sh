@@ -38,5 +38,20 @@ for k in "$DIR"/*.hip; do
   fi
 done
 
+# The generated kernel prologue. Not a file in kernels/ because it has to be
+# produced first -- the emitted text is not valid C++ until the kernel-name
+# placeholder is substituted (see gen_prologue.cpp).
+GEN="$(dirname "$BIN")/gen_prologue"
+if [ -x "$GEN" ]; then
+  "$GEN" 4 > /tmp/hip_validate_prologue.hip 2>/dev/null
+  if "$BIN" --no-exec /tmp/hip_validate_prologue.hip >/dev/null 2>&1; then
+    printf "  %-20s PASS  (generated, gfx arm only)\\n" "prologue"
+    pass=$((pass+1))
+  else
+    printf "  %-20s FAIL  (generated prologue does not compile)\\n" "prologue"
+    fail=$((fail+1))
+  fi
+fi
+
 echo "  ---- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
