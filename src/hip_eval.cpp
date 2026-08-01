@@ -83,6 +83,29 @@ static void render_fp_or_int(Variable *v, const char *fp_fn, const char *int_fn)
     render_call(v, jitc_is_float(v) ? fp_fn : int_fn, 2);
 }
 
+/// True if `v` is double precision.
+///
+/// Worth a named helper rather than an inline comparison: nearly every math
+/// function below has a distinct `double` spelling (sqrt vs sqrtf), and
+/// reaching for the `f` form on a Float64 would silently round-trip through
+/// single precision. That is the same class of mistake as Metal's Float64
+/// promotion, which this backend exists partly to avoid.
+static bool is_f64(const Variable *v) {
+    return (VarType) v->type == VarType::Float64;
+}
+
+/// Emit a math call, choosing the double or float spelling by operand type.
+/// `base` is the double name; the float form is `base` + "f".
+static void render_math(Variable *v, const char *base, uint32_t n_args = 1) {
+    if (is_f64(v)) {
+        render_call(v, base, n_args);
+    } else {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%sf", base);
+        render_call(v, buf, n_args);
+    }
+}
+
 static void jitc_hip_render(Variable *v) {
     switch ((VarKind) v->kind) {
         case VarKind::Nop:
@@ -152,8 +175,89 @@ static void jitc_hip_render(Variable *v) {
             render_call(v, jitc_is_float(v) ? "fmaf" : "__mad", 3);
             break;
 
-        case VarKind::Min: render_fp_or_int(v, "fminf", "min"); break;
-        case VarKind::Max: render_fp_or_int(v, "fmaxf", "max"); break;
+        case VarKind::Min:
+            if (jitc_is_float(v)) render_math(v, "fmin", 2);
+            else                  render_call(v, "min", 2);
+            break;
+        case VarKind::Max:
+            if (jitc_is_float(v)) render_math(v, "fmax", 2);
+            else                  render_call(v, "max", 2);
+            break;
+
+        // --- Rounding -------------------------------------------------------
+        //
+        // Round is rintf (nearest-EVEN), NOT roundf (half away from zero) --
+        // the latter would disagree with the CUDA backend on exactly the .5
+        // cases (spec_compare.hip, BACKEND_NOTES §11a).
+        case VarKind::Ceil:  render_math(v, "ceil");  break;
+        case VarKind::Floor: render_math(v, "floor"); break;
+        case VarKind::Round: render_math(v, "rint");  break;
+        case VarKind::Trunc: render_math(v, "trunc"); break;
+
+        // --- Transcendentals ------------------------------------------------
+        //
+        // The fast device forms, matching what the CUDA backend selects from
+        // the same VarKinds ("multi-function generator"). Note there is no
+        // __exp2f on either platform, unlike its neighbours.
+        case VarKind::Sin:  render_call(v, "__sinf", 1);  break;
+        case VarKind::Cos:  render_call(v, "__cosf", 1);  break;
+        case VarKind::Exp2: render_call(v, "exp2f", 1);   break;
+        case VarKind::Log2: render_call(v, "__log2f", 1); break;
+        case VarKind::Tanh: render_math(v, "tanh");       break;
+
+        // --- Fast approximations ---------------------------------------------
+        case VarKind::Rcp:
+            fmt("$t $v = ($t) 1 / $v;\n", v, v, v, jitc_var(v->dep[0]));
+            break;
+        case VarKind::RcpApprox:   render_call(v, "__frcp_rn", 1);  break;
+        case VarKind::RSqrtApprox: render_call(v, "rsqrtf", 1);     break;
+        case VarKind::SqrtApprox:  render_call(v, "__fsqrt_rn", 1); break;
+        case VarKind::DivApprox:   render_call(v, "__fdividef", 2); break;
+
+        // --- Bit counting -----------------------------------------------------
+        case VarKind::Popc: render_call(v, "__popc", 1); break;
+        case VarKind::Clz:  render_call(v, "__clz", 1);  break;
+        case VarKind::Brev: render_call(v, "__brev", 1); break;
+
+        case VarKind::Ctz:
+            // No __ctz exists on either platform; __ffs is 1-based.
+            fmt("$t $v = ($t) (__ffs($v) - 1);\n", v, v, v,
+                jitc_var(v->dep[0]));
+            break;
+
+        // --- Wide multiplication ----------------------------------------------
+        //
+        // These exist as opcodes precisely because `a * b` is computed modulo
+        // the operand width, discarding what they need (spec_mulwide.hip).
+        case VarKind::MulHi:
+            render_call(v, jitc_is_uint(v) ? "__umulhi" : "__mulhi", 2);
+            break;
+
+        case VarKind::MulWide:
+            // Widen BEFORE multiplying; casting the product would truncate.
+            fmt("$t $v = ($t) $v * ($t) $v;\n", v, v, v,
+                jitc_var(v->dep[0]), v, jitc_var(v->dep[1]));
+            break;
+
+        // --- Conversions -------------------------------------------------------
+        case VarKind::Cast:
+            fmt("$t $v = ($t) $v;\n", v, v, v, jitc_var(v->dep[0]));
+            break;
+
+        case VarKind::Bitcast: {
+            Variable *a = jitc_var(v->dep[0]);
+            bool wide = is_f64(v) || is_f64(a);
+            // Reinterpret through the device intrinsics rather than a pointer
+            // cast or __builtin_bit_cast -- the latter is Clang-only and NVRTC
+            // rejects it (BACKEND_NOTES §11a).
+            const char *fn;
+            if (jitc_is_float(v))
+                fn = wide ? "__longlong_as_double" : "__uint_as_float";
+            else
+                fn = wide ? "__double_as_longlong" : "__float_as_uint";
+            render_call(v, fn, 1);
+            break;
+        }
 
         default:
             jitc_fail("jitc_hip_render(): unhandled variable kind \"%s\"! The "

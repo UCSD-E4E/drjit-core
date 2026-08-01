@@ -82,6 +82,54 @@ int main(int, char **) {
     jit_var_dec_ref(a);    jit_var_dec_ref(b);   jit_var_dec_ref(sum);
     jit_var_dec_ref(five); jit_var_dec_ref(c);   jit_var_dec_ref(c_evaluated);
 
+    // ---- Beyond the milestone: the wider opcode surface --------------------
+    //
+    // The milestone above only exercises Add and Mul. These cover the opcodes
+    // added alongside it, each of which has a matching specimen in
+    // tools/hip_validate/kernels/. Values are chosen so a wrong intrinsic
+    // shifts the result rather than happening to agree.
+    {
+        uint32_t idx  = jit_var_counter(JitBackend::HIP, N);
+        uint32_t idxf = jit_var_cast(idx, VarType::Float32, 0);   // Cast
+
+        uint32_t four = jit_var_f32(JitBackend::HIP, 4.0f);
+        uint32_t d2[2] = { idxf, four };
+        uint32_t scaled = jit_var_op(JitOp::Mul, d2);             // f32 Mul
+
+        uint32_t sq_deps[1] = { scaled };
+        uint32_t root = jit_var_op(JitOp::Sqrt, sq_deps);         // Sqrt
+
+        // Min against a constant exercises the float spelling (fminf).
+        uint32_t cap = jit_var_f32(JitBackend::HIP, 10.0f);
+        uint32_t md[2] = { root, cap };
+        uint32_t clamped = jit_var_op(JitOp::Min, md);            // Min
+
+        // Floor, then compare -- exercises rounding and a bool-producing op.
+        uint32_t fl_deps[1] = { clamped };
+        uint32_t fl = jit_var_op(JitOp::Floor, fl_deps);          // Floor
+
+        jit_var_eval(fl);
+        void *fp = nullptr;
+        uint32_t fl_eval = jit_var_data(fl, &fp);
+
+        float hostf[N];
+        jit_memcpy(JitBackend::HIP, hostf, fp, sizeof(hostf));
+
+        bool ok = true;
+        for (uint32_t i = 0; i < N; ++i) {
+            float want = std::sqrt((float) i * 4.0f);
+            if (want > 10.0f) want = 10.0f;
+            want = std::floor(want);
+            if (hostf[i] != want)
+                ok = false;
+        }
+        check(ok, "Cast/Mul/Sqrt/Min/Floor chain correct for all lanes");
+
+        jit_var_dec_ref(idx);  jit_var_dec_ref(idxf); jit_var_dec_ref(four);
+        jit_var_dec_ref(scaled); jit_var_dec_ref(root); jit_var_dec_ref(cap);
+        jit_var_dec_ref(clamped); jit_var_dec_ref(fl); jit_var_dec_ref(fl_eval);
+    }
+
     jit_shutdown(0);
 
     if (failures) {
