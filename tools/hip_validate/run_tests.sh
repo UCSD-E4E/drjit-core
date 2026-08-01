@@ -25,7 +25,12 @@ for k in "$DIR"/*.hip; do
   expect_fail=0
   case "$name" in broken_*) expect_fail=1 ;; esac
 
-  if "$BIN" "$k" >/dev/null 2>&1; then rc=0; else rc=1; fi
+  # spec_* kernels are self-checking: they write 0 on success and a bit-per-op
+  # error code on mismatch, so --expect-zero turns "it ran" into "it is right".
+  extra=""
+  case "$name" in spec_*) extra="--expect-zero" ;; esac
+
+  if "$BIN" $extra "$k" >/dev/null 2>&1; then rc=0; else rc=1; fi
 
   if [ "$rc" -eq "$expect_fail" ]; then
     printf '  %-20s PASS%s\n' "$name" \
