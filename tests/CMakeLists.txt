@@ -65,6 +65,13 @@ if (DRJIT_ENABLE_HIP)
   add_test(NAME hip_types COMMAND hip_types
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
+  # Literal materialisation. Pure, no device needed.
+  add_executable(hip_literal hip_literal.cpp)
+  set_property(TARGET hip_literal PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_literal PRIVATE drjit-core)
+  add_test(NAME hip_literal COMMAND hip_literal
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
   # Reindent pass. Pure string transform, no device and no JIT state.
   add_executable(hip_format hip_format.cpp)
   set_property(TARGET hip_format PROPERTY CXX_STANDARD 17)

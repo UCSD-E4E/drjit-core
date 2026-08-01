@@ -30,6 +30,10 @@
    header rather than being a builtin -- hence the include above. */
 #define DRJIT_HALF __half
 
+/* Reinterpret 16 raw bits as a half. Paired with jitc_hip_literal(), which
+   emits float constants as bit patterns rather than decimals. */
+#define DRJIT_HALF_FROM_BITS(bits) __ushort_as_half((unsigned short) (bits))
+
 typedef uint64_t DRJIT_LANE_MASK_T;
 
 #define DRJIT_TID \
