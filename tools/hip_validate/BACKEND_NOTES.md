@@ -309,6 +309,42 @@ with error code 24, which was a bug in the *specimen* — it asserted
 only legitimate for exactly-representable operands. Inspection would not have
 caught that.
 
+## 11c. Further constraints found by the specimens
+
+Each of these compiled cleanly and still would have been wrong.
+
+**`__exp2f` does not exist.** The fast-intrinsic naming is *not* uniform:
+`__sinf`, `__cosf`, `__log2f`, `__fdividef`, `__frcp_rn`, `__fsqrt_rn` all
+exist on both platforms, but there is no `__exp2f` on either. Emit `exp2f` for
+`VarKind::Exp2`. Do not assume a `__`-prefixed form exists just because its
+neighbours do.
+
+**No barrier below the bounds-check `return`.** The prologue guards with an
+early `return` for lanes past the end (§ prologue). Any `__syncthreads()` after
+that point is undefined — the returned threads never arrive — and the launch
+fails at runtime rather than at compile time. If codegen ever needs a barrier
+(block reductions, shared-memory staging), either the barrier must dominate the
+guard or the guard must become a predicated region instead of a return.
+
+**Atomics must target global memory.** Dr.Jit's `ScatterInc` / `ScatterExch` /
+`ScatterCAS` always address a device buffer. Emitting an atomic against a
+materialised temporary takes the address of a local, forces private memory, and
+— this is the dangerous part — **compiles on both arms and then fails at
+launch**. Always route atomics through the buffer pointer.
+
+The last two share a signature worth internalising: *compiles everywhere, dies
+at launch*. Neither arm's compiler can catch them, so the execution arm is the
+only thing standing between these and a debugging session on the MI210.
+
+**Approximations are not bit-exact and must not be pinned as if they were.**
+`Sin`/`Cos`/`Exp2`/`Log2`/`Tanh` are the multi-function-generator ops — NVIDIA's
+SFU path, gfx90a's `V_SIN_F32`/`V_EXP_F32` — and the `*Approx` kinds are
+explicitly licensed to be sloppy. `kernels/spec_math.hip` checks them against
+identities with deliberately loose tolerances. Tightening those is the wrong
+instinct: it would either fail on real hardware or set an expectation the MI210
+cannot meet. Accurate and approximate forms are checked at *different*
+tolerances on purpose — that asymmetry is the specification.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
