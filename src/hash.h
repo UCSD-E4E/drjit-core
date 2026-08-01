@@ -76,13 +76,19 @@ inline size_t hash_str(const char *str) {
 }
 
 /// Hash the IR of a just-generated kernel, starting at its body. CUDA and LLVM
-/// unconditionally emit a "body:" label; Metal has no such label, and hashing
-/// starts at the first '{' (of its ``struct Params`` declaration) instead.
+/// unconditionally emit a "body:" label; the SOURCE-emitting backends (Metal,
+/// HIP) have no such label, so hashing starts at the first '{' -- the opening
+/// brace of their ``struct Params`` declaration -- instead.
+///
+/// Starting at the body rather than byte zero is what lets the kernel-name
+/// placeholder differ without changing the hash.
 inline XXH128_hash_t hash_kernel(const char *str, size_t size,
                                  JitBackend backend) {
-    const char *offset = backend == JitBackend::Metal
-                             ? strchr(str, '{')
-                             : strstr(str, "body:");
+    bool source_backend = backend == JitBackend::Metal ||
+                          backend == JitBackend::HIP;
+
+    const char *offset = source_backend ? strchr(str, '{')
+                                        : strstr(str, "body:");
 
     if (unlikely(!offset))
         jitc_fail("hash_kernel(): could not locate the start of the kernel body!");

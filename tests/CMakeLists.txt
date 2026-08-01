@@ -99,16 +99,16 @@ if (DRJIT_ENABLE_HIP)
 
   # Phase 2 acceptance gate, written before the implementation.
   #
-  # WILL_FAIL keeps ctest green while codegen is unimplemented. When Phase 2
-  # starts working this test passes, WILL_FAIL then reports it as a FAILURE,
-  # and that red is the signal to delete the property below. Do not remove it
-  # earlier, and do not weaken the test to make it pass.
+  # WILL_FAIL was removed when Phase 2 started working -- the tripwire fired as
+  # designed. The test now guards the milestone rather than predicting it.
   add_executable(hip_codegen hip_codegen.cpp)
   set_property(TARGET hip_codegen PROPERTY CXX_STANDARD 17)
   target_link_libraries(hip_codegen PRIVATE drjit-core)
   add_test(NAME hip_codegen COMMAND hip_codegen
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
-  set_tests_properties(hip_codegen PROPERTIES WILL_FAIL TRUE)
+  # Skips rather than fails when the backend is inert (a default Phase 0a
+  # build), so an untouched configuration does not look broken.
+  set_tests_properties(hip_codegen PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 add_executable(microbenchmark microbenchmark.cpp)

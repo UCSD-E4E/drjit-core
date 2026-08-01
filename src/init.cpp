@@ -495,9 +495,19 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
         // so it needs the CUDA device's stream and events -- it will really
         // submit work through them.
         ts = new HIPThreadState();
+
+        // Mirror the CUDA arm's setup EXACTLY. Under the shim this really is a
+        // CUDAThreadState, so every field it consults must be populated --
+        // omitting compute_capability / ptx_version / memory_pool the first
+        // time produced a SIGFPE inside the launch path rather than a clear
+        // error, because a zero divisor is not something the launch config
+        // validates.
         CUDADevice &hd = state.devices[0];
         ts->device = 0;
         ts->context = hd.context;
+        ts->compute_capability = hd.compute_capability;
+        ts->ptx_version = hd.ptx_version;
+        ts->memory_pool = hd.memory_pool;
         ts->stream = hd.stream;
         ts->event = hd.event;
         ts->sync_stream_event = hd.sync_stream_event;

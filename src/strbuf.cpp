@@ -1,6 +1,9 @@
 #include "strbuf.h"
 #include "internal.h"
 #include "var.h"
+#if defined(DRJIT_ENABLE_HIP)
+#  include "hip_eval.h"   // type_name_hip / type_name_hip_bin, used by fmt_hip
+#endif
 #include "eval.h"
 #include <cstdarg>
 
@@ -870,6 +873,109 @@ void StringBuffer::fmt_metal(size_t nargs, size_t fmt_len, const char *fmt, ...)
     if (unlikely(arg != nargs)) {
         fprintf(stderr,
                 "StringBuffer::fmt_metal(): given %zu args, format string "
+                "accessed %zu (%s)\n", nargs, arg, fmt);
+        abort();
+    }
+
+    *cur = '\0';
+    m_cur = cur;
+}
+#endif
+
+#if defined(DRJIT_ENABLE_HIP)
+/// HIP-specific formatting routine.
+///
+/// Structurally identical to fmt_metal() above -- the $ codes and their
+/// semantics are the same. The ONLY differences are the two type tables:
+/// $t resolves through type_name_hip and $b through type_name_hip_bin, which
+/// is what keeps Float64 as `double` (Metal promotes it to float, since Apple
+/// GPUs have no FP64) and gives $b a 64-bit binary view rather than a
+/// truncating 32-bit one. See src/hip_eval.h.
+///
+/// The duplication is upstream's established pattern -- fmt_llvm, fmt_cuda and
+/// fmt_metal are likewise near-identical -- rather than something introduced
+/// here. Folding them into one templated routine would be a larger and more
+/// invasive change than a new backend should carry (PLAN.md §9).
+void StringBuffer::fmt_hip(size_t nargs, size_t fmt_len, const char *fmt, ...) {
+    va_list args2;
+    va_start(args2, fmt);
+
+    // Bound the maximum output size needed by the format string and arguments
+    size_t bound = fmt_bound(fmt_len, nargs);
+    if (unlikely(!m_cur || m_cur + bound >= m_end))
+        m_cur = expand(m_cur, bound);
+
+    const char *p = fmt, *fmt_end = fmt + fmt_len;
+    char *cur = m_cur;
+    size_t arg = 0;
+    while (p < fmt_end) {
+        cur = w_run(cur, p, fmt_end);
+        if (p == fmt_end)
+            break;
+        ++p; // consume '$'
+
+        switch (*p++) {
+            case 'u': cur = w_u32(cur, va_arg(args2, uint32_t)); break;
+
+            case 's': {
+                    const char *s = va_arg(args2, const char *);
+                    // Inserting an arbitrary string might break the previous
+                    // upper bound; re-bound and potentially expand.
+                    size_t rest = fmt_bound((size_t) (fmt_end - p), nargs - arg - 1);
+                    size_t len = strlen(s);
+                    if (unlikely(cur + len + rest >= m_end))
+                        cur = expand(cur, len + rest);
+                    cur = w_strn(cur, s, len);
+                }
+                break;
+
+            case 't': {
+                    const Variable *v = va_arg(args2, const Variable *);
+                    cur = w_type(cur, type_name_hip[v->type]);
+                }
+                break;
+
+            case 'b': {
+                    const Variable *v = va_arg(args2, const Variable *);
+                    cur = w_type(cur, type_name_hip_bin[v->type]);
+                }
+                break;
+
+            case 'v': {
+                    const Variable *v = va_arg(args2, const Variable *);
+                    *cur++ = 'r';
+                    cur = w_u32(cur, v->reg_index);
+                }
+                break;
+
+            case 'l': {
+                    const Variable *v = va_arg(args2, const Variable *);
+                    *cur++ = '0';
+                    *cur++ = 'x';
+                    cur = w_x64(cur, v->literal);
+                }
+                break;
+
+            case 'o': {
+                    const Variable *v = va_arg(args2, const Variable *);
+                    cur = w_u32(cur, v->param_offset / (uint32_t) sizeof(void *) - 1);
+                }
+                break;
+
+            default:
+                fprintf(stderr,
+                        "StringBuffer::fmt_hip(): encountered unsupported "
+                        "character \"$%c\" in format string!\n", p[-1]);
+                abort();
+        }
+
+        ++arg;
+    }
+    va_end(args2);
+
+    if (unlikely(arg != nargs)) {
+        fprintf(stderr,
+                "StringBuffer::fmt_hip(): given %zu args, format string "
                 "accessed %zu (%s)\n", nargs, arg, fmt);
         abort();
     }

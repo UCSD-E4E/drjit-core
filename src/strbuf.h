@@ -174,6 +174,15 @@ public:
     void fmt_metal(size_t nargs, size_t fmt_len, const char *fmt, ...);
 #endif
 
+#if defined(DRJIT_ENABLE_HIP)
+    /**
+     * \brief HIP-specific formatting routine. Same syntax as the Metal one
+     * (see the top of metal_eval.cpp); it differs only in resolving $t / $b
+     * through type_name_hip / type_name_hip_bin.
+     */
+    void fmt_hip(size_t nargs, size_t fmt_len, const char *fmt, ...);
+#endif
+
     /**
      * \brief Append a formatted (printf-style) string to the buffer
      *

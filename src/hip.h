@@ -27,6 +27,19 @@ extern bool jitc_hip_init();
 /// Release all resources held by the HIP backend.
 extern void jitc_hip_shutdown();
 
+#if defined(DRJIT_HIP_CUDA_SHIM)
+/// Compile generated HIP C++ source into a loadable module.
+///
+/// Under the shim this runs NVRTC over the source to obtain PTX and then hands
+/// that to jitc_cuda_compile(), so the resulting CUmodule lands in the same
+/// kernel.cuda.mod slot CUDAThreadState::launch() reads. On real hardware the
+/// equivalent is hiprtc -> hipModuleLoadData; the call SHAPE is identical,
+/// which tools/hip_validate/hipnv_pipeline.cpp verifies against the real API.
+///
+/// Returns (module, cache_hit), matching jitc_cuda_compile().
+extern std::pair<void *, bool> jitc_hip_compile(const char *source);
+#endif
+
 // NOTE: jitc_hip_assemble / _reset / jitc_hip_format are declared in eval.h,
 // not here. That mirrors the Metal backend and is deliberate: those entry
 // points take ScheduledGroup, and eval.cpp must be able to call them without

@@ -44,43 +44,40 @@ int main(int, char **) {
     // gfx90a has full-rate FP64. Metal promotes Float64 -> Float32 because
     // Apple GPUs have no doubles at all; inheriting that here would quietly
     // halve precision on the MI210's strongest capability.
-    check_str(type_name_hip[(int) VarType::Float64], "double",
-              "Float64 -> \"double\"  (NOT \"float\", cf. Metal)");
+    check_str(type_name_hip[(int) VarType::Float64], "f64",
+              "Float64 -> \"f64\" (a REAL 64-bit type, NOT promoted)");
     check(strcmp(type_name_hip[(int) VarType::Float64],
                  type_name_hip[(int) VarType::Float32]) != 0,
           "Float64 and Float32 map to different types");
 
     // --- Floating point -----------------------------------------------------
-    check_str(type_name_hip[(int) VarType::Float32], "float",  "Float32 -> \"float\"");
-    // Not a concrete type: __half is header-declared on both platforms, so the
-    // emitter must go through the prelude. Proven by tools/hip_validate.
-    check_str(type_name_hip[(int) VarType::Float16], "DRJIT_HALF",
-              "Float16 -> DRJIT_HALF (prelude macro, not a builtin)");
+    check_str(type_name_hip[(int) VarType::Float32], "f32", "Float32 -> f32");
+    check_str(type_name_hip[(int) VarType::Float16], "f16", "Float16 -> f16");
 
     // --- Integers. HIP is C++, so use the fixed-width types rather than
     //     Metal's short/long spellings, whose sizes are platform-defined.
-    check_str(type_name_hip[(int) VarType::Int8],   "int8_t",   "Int8");
-    check_str(type_name_hip[(int) VarType::UInt8],  "uint8_t",  "UInt8");
-    check_str(type_name_hip[(int) VarType::Int16],  "int16_t",  "Int16");
-    check_str(type_name_hip[(int) VarType::UInt16], "uint16_t", "UInt16");
-    check_str(type_name_hip[(int) VarType::Int32],  "int32_t",  "Int32");
-    check_str(type_name_hip[(int) VarType::UInt32], "uint32_t", "UInt32");
-    check_str(type_name_hip[(int) VarType::Int64],  "int64_t",  "Int64");
-    check_str(type_name_hip[(int) VarType::UInt64], "uint64_t", "UInt64");
+    check_str(type_name_hip[(int) VarType::Int8],   "i8",  "Int8");
+    check_str(type_name_hip[(int) VarType::UInt8],  "u8",  "UInt8");
+    check_str(type_name_hip[(int) VarType::Int16],  "i16", "Int16");
+    check_str(type_name_hip[(int) VarType::UInt16], "u16", "UInt16");
+    check_str(type_name_hip[(int) VarType::Int32],  "i32", "Int32");
+    check_str(type_name_hip[(int) VarType::UInt32], "u32", "UInt32");
+    check_str(type_name_hip[(int) VarType::Int64],  "i64", "Int64");
+    check_str(type_name_hip[(int) VarType::UInt64], "u64", "UInt64");
     check_str(type_name_hip[(int) VarType::Bool],   "bool",     "Bool");
 
     // A pointer must be an integer wide enough to hold a device address, not
     // a typed pointer -- emitted code casts it per use site.
-    check_str(type_name_hip[(int) VarType::Pointer], "uint64_t", "Pointer -> uint64_t");
+    check_str(type_name_hip[(int) VarType::Pointer], "u64", "Pointer -> u64");
 
     // --- Binary view --------------------------------------------------------
     //
     // Used for bitcasts and bit-wise ops. Must be an unsigned integer of the
     // same width, so a bitwise NOT on a float does not go through the FPU.
-    check_str(type_name_hip_bin[(int) VarType::Float32], "uint32_t", "bin Float32 -> uint32_t");
-    check_str(type_name_hip_bin[(int) VarType::Float64], "uint64_t", "bin Float64 -> uint64_t (64-bit!)");
-    check_str(type_name_hip_bin[(int) VarType::Float16], "uint16_t", "bin Float16 -> uint16_t");
-    check_str(type_name_hip_bin[(int) VarType::Bool],    "uint8_t",  "bin Bool -> uint8_t");
+    check_str(type_name_hip_bin[(int) VarType::Float32], "u32", "bin Float32 -> u32");
+    check_str(type_name_hip_bin[(int) VarType::Float64], "u64", "bin Float64 -> u64 (64-bit!)");
+    check_str(type_name_hip_bin[(int) VarType::Float16], "u16", "bin Float16 -> u16");
+    check_str(type_name_hip_bin[(int) VarType::Bool],    "u8",  "bin Bool -> u8");
 
     // Regression guard: the binary view must never be narrower than the value
     // it aliases. Metal's table maps Float64 to "uint" (32-bit) because
@@ -105,6 +102,28 @@ int main(int, char **) {
         if (strcmp(type_name_hip[(int) vt], "???") == 0)
             complete = false;
     check(complete, "every instantiable VarType has a HIP mapping");
+
+    // --- The 6-character limit ----------------------------------------------
+    //
+    // THE CHECK THAT WOULD HAVE SAVED AN AFTERNOON. w_type() in strbuf.cpp
+    // copies a fixed 8-byte row and reads its length from BYTE 7, so a name
+    // longer than 6 characters is not a compile error in a release build --
+    // byte 7 is read as a character and the output cursor jumps that far past
+    // the end. "uint32_t" advanced it by 't' == 116 and silently truncated the
+    // generated kernel mid-statement, which surfaced as an NVRTC syntax error
+    // about an unterminated function.
+    //
+    // NameTable throws on over-long entries in debug builds; this asserts it in
+    // every build, and for the binary table too.
+    {
+        bool short_enough = true;
+        for (int i = 0; i < (int) VarType::Count; ++i) {
+            if (strlen(type_name_hip[i]) > 6)     short_enough = false;
+            if (strlen(type_name_hip_bin[i]) > 6) short_enough = false;
+        }
+        check(short_enough,
+              "every type name fits w_type()'s 6-char limit");
+    }
 
     if (failures) {
         printf("hip_types: %d check(s) FAILED\n", failures);

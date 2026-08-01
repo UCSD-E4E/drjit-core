@@ -29,6 +29,10 @@
 #include "hip.h"
 #include "log.h"
 #include "internal.h"
+#include "cuda.h"
+#include <dlfcn.h>
+#include <vector>
+#include <utility>
 
 #if defined(DRJIT_ENABLE_HIP)
 
@@ -96,5 +100,100 @@ void jitc_hip_shutdown() {
     state.hip_devices.clear();
 #endif
 }
+
+
+#if defined(DRJIT_HIP_CUDA_SHIM)
+// ---------------------------------------------------------------------------
+//  Shim kernel compilation: HIP source -> NVRTC -> PTX -> CUmodule
+// ---------------------------------------------------------------------------
+//
+// NVRTC is resolved with dlopen rather than linked, matching how cuda_api.cpp
+// resolves libcuda -- drjit-core must keep building on machines without a CUDA
+// toolkit (§3.4).
+
+typedef void *nvrtcProgram;
+typedef int   nvrtcResult;
+
+static nvrtcResult (*nv_CreateProgram)(nvrtcProgram *, const char *, const char *,
+                                       int, const char **, const char **);
+static nvrtcResult (*nv_CompileProgram)(nvrtcProgram, int, const char **);
+static nvrtcResult (*nv_GetProgramLogSize)(nvrtcProgram, size_t *);
+static nvrtcResult (*nv_GetProgramLog)(nvrtcProgram, char *);
+static nvrtcResult (*nv_GetPTXSize)(nvrtcProgram, size_t *);
+static nvrtcResult (*nv_GetPTX)(nvrtcProgram, char *);
+static nvrtcResult (*nv_DestroyProgram)(nvrtcProgram *);
+
+static bool jitc_hip_nvrtc_init() {
+    static int state = 0;   // 0 = untried, 1 = ready, -1 = unavailable
+    if (state)
+        return state > 0;
+
+    void *h = dlopen("libnvrtc.so.12", RTLD_LAZY);
+    if (!h) h = dlopen("libnvrtc.alt.so.12", RTLD_LAZY);
+    if (!h) h = dlopen("libnvrtc.so", RTLD_LAZY);
+    if (!h) {
+        jitc_log(Warn, "jit_hip_compile(): the CUDA shim needs libnvrtc to "
+                       "compile generated HIP source, but it could not be "
+                       "loaded.");
+        state = -1;
+        return false;
+    }
+
+#define BIND(dst, name)                                                        \
+    *(void **) &dst = dlsym(h, name);                                          \
+    if (!dst) { state = -1; return false; }
+
+    BIND(nv_CreateProgram,     "nvrtcCreateProgram")
+    BIND(nv_CompileProgram,    "nvrtcCompileProgram")
+    BIND(nv_GetProgramLogSize, "nvrtcGetProgramLogSize")
+    BIND(nv_GetProgramLog,     "nvrtcGetProgramLog")
+    BIND(nv_GetPTXSize,        "nvrtcGetPTXSize")
+    BIND(nv_GetPTX,            "nvrtcGetPTX")
+    BIND(nv_DestroyProgram,    "nvrtcDestroyProgram")
+#undef BIND
+
+    state = 1;
+    return true;
+}
+
+std::pair<void *, bool> jitc_hip_compile(const char *source) {
+    if (!jitc_hip_nvrtc_init())
+        jitc_fail("jit_hip_compile(): NVRTC is unavailable.");
+
+    nvrtcProgram prog;
+    if (nv_CreateProgram(&prog, source, "drjit_hip.hip", 0, nullptr, nullptr))
+        jitc_fail("jit_hip_compile(): nvrtcCreateProgram() failed.");
+
+    // The real backend passes --offload-arch=<gfx>; only the option spelling
+    // differs, not the shape of the call.
+    const char *opts[] = { "--gpu-architecture=compute_86", "--std=c++17" };
+
+    if (nv_CompileProgram(prog, 2, opts)) {
+        size_t log_size = 0;
+        nv_GetProgramLogSize(prog, &log_size);
+        std::vector<char> log(log_size + 1, 0);
+        nv_GetProgramLog(prog, log.data());
+        // Print the source alongside the diagnostics. When a code GENERATOR
+        // produces something the compiler rejects, the message alone is close
+        // to useless -- the interesting artifact is the text itself, and
+        // reproducing it otherwise means re-running under PrintIR.
+        jitc_log(Warn, "jit_hip_compile(): generated source that failed to "
+                       "compile:\n%s", source);
+        jitc_fail("jit_hip_compile(): compilation of generated source failed:\n%s",
+                  log.data());
+    }
+
+    size_t ptx_size = 0;
+    nv_GetPTXSize(prog, &ptx_size);
+    std::vector<char> ptx(ptx_size);
+    nv_GetPTX(prog, ptx.data());
+    nv_DestroyProgram(&prog);
+
+    // Hand the PTX to the CUDA path so the module lands in kernel.cuda.mod,
+    // which is what CUDAThreadState::launch() reads.
+    auto [mod, hit] = jitc_cuda_compile(ptx.data());
+    return { (void *) mod, hit };
+}
+#endif // DRJIT_HIP_CUDA_SHIM
 
 #endif // DRJIT_ENABLE_HIP

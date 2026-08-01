@@ -26,6 +26,10 @@
 /// source, since strstr() takes the first match.
 inline constexpr int JITC_HIP_HASH_CARETS = 32;
 
+/// Types are the SHORT spellings from hip_eval.h (u32, not uint32_t) -- the
+/// formatter caps type names at 6 characters, and the kernel preamble typedefs
+/// them. Mixing the two spellings compiles only by accident.
+///
 /// Emit the kernel prologue for a launch taking `n_params` kernel parameters.
 ///
 /// Leaves the kernel body open; the caller emits the variable loop and the
@@ -50,7 +54,7 @@ inline std::string jitc_hip_kernel_prologue(uint32_t n_params) {
     char buf[128];
     snprintf(buf, sizeof(buf),
              "struct Params {\n"
-             "    uint32_t size;\n"
+             "    u32 size;\n"
              "    void *args[%u];\n"
              "};\n\n",
              n_args);
@@ -69,7 +73,7 @@ inline std::string jitc_hip_kernel_prologue(uint32_t n_params) {
     // threads past the end of every buffer. Without this, those threads write
     // out of bounds -- corrupting neighbouring allocations rather than
     // faulting, which is the hardest failure mode to trace back here.
-    s += "    uint32_t r0 = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    s += "    u32 r0 = blockIdx.x * blockDim.x + threadIdx.x;\n"
          "    if (r0 >= params.size)\n"
          "        return;\n";
 

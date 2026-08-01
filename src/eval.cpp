@@ -15,6 +15,9 @@
 #include "profile.h"
 #include "util.h"
 #include "optix.h"
+#if defined(DRJIT_ENABLE_HIP)
+#  include "hip.h"
+#endif
 #include "loop.h"
 #include "call.h"
 #include "coop_vec.h"
@@ -760,6 +763,19 @@ Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
                                                   kernel_name, kernel);
         } else
 #endif
+#if defined(DRJIT_HIP_CUDA_SHIM)
+        if (jitc_is_hip(ts->backend)) {
+            ProfilerPhase profiler(profiler_region_backend_compile);
+            // Same `kernel.size = 1` marker the CUDA path uses to distinguish a
+            // module-backed kernel; the module itself goes in kernel.cuda.mod,
+            // which is what CUDAThreadState::launch() reads.
+            kernel.size = 1;
+            kernel.data = nullptr;
+            void *mod = nullptr;
+            std::tie(mod, cache_hit) = jitc_hip_compile(buffer.get());
+            kernel.cuda.mod = (CUmodule) mod;
+        } else
+#endif
         {
             cache_hit = jitc_kernel_load(buffer.get(), (uint32_t) buffer.size(),
                                          ts->backend, kernel_hash, kernel);
@@ -781,7 +797,16 @@ Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
                     np * sizeof(KernelParamInfo));
 
 #if defined(DRJIT_ENABLE_CUDA)
-        if (jitc_is_cuda(ts->backend) && !uses_optix) {
+        // The CUDA shim produces a real CUmodule with the same drjit_<hash>
+        // entry-point convention, so it needs this block too. Skipping it left
+        // kernel.cuda.func null and block_size zero, which surfaced as a SIGFPE
+        // at launch (a zero block size is divided by, not validated).
+        bool cuda_module_kernel = jitc_is_cuda(ts->backend);
+#  if defined(DRJIT_HIP_CUDA_SHIM)
+        cuda_module_kernel |= jitc_is_hip(ts->backend);
+#  endif
+
+        if (cuda_module_kernel && !uses_optix) {
             // Locate the kernel entry point
             size_t offset = buffer.size();
             const char *name_fmt = "drjit_$Q$Q";

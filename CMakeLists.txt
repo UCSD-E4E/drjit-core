@@ -188,6 +188,7 @@ if (DRJIT_ENABLE_HIP)
     src/hip_prologue.h
     src/hip_literal.h
     src/hip_format.h
+    src/hip_codegen.h
     src/hip_eval.h
     src/hip_eval.cpp)
 endif()
