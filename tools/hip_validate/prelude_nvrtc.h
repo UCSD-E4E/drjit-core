@@ -25,6 +25,18 @@ typedef unsigned long long uint64_t;
    the wave64-unverified list until MI210 access. */
 #define DRJIT_WARP_SIZE 32u
 
+/* Half precision.
+
+   NVRTC does not ship cuda_fp16.h, and _Float16 is not reliably available on
+   the device side here, so the execution arm cannot represent fp16 faithfully.
+   Aliasing to float keeps fp16 kernels COMPILABLE and RUNNABLE on this arm --
+   useful for checking surrounding logic -- but the values carry f32 precision.
+
+   Consequence: fp16 numerics are verified by the gfx arm only, and belong on
+   the same "unverified on NVIDIA" list as wave64 semantics (PLAN.md §0.3,
+   §7.2). Do not use this arm to sign off rounding behaviour. */
+#define DRJIT_HALF float
+
 /* Deliberately 64-bit even though CUDA ballots are 32-bit, so that emitted
    code never assumes 32. The widening is free and keeps one type across arms. */
 typedef uint64_t DRJIT_LANE_MASK_T;

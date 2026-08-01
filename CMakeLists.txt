@@ -180,6 +180,7 @@ if (DRJIT_ENABLE_HIP)
   set(DRJIT_HIP_FILES
     src/hip.h
     src/hip_core.cpp
+    src/hip_eval.h
     src/hip_eval.cpp)
 endif()
 

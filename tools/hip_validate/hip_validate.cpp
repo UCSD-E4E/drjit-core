@@ -429,6 +429,9 @@ int main(int argc, char **argv) {
 
     // Reminder rather than a failure: the execution arm is warp-32, so wave64
     // semantics remain unverified until MI210 access (PLAN.md §0.3, §7.2).
+    if (all && o.run_exec && kernel_src.find("DRJIT_HALF") != std::string::npos)
+        printf("  note: uses fp16; NVIDIA arm aliases DRJIT_HALF to float, so\n"
+               "        rounding is NOT verified here (§0.3)\n");
     if (all && o.run_exec &&
         kernel_src.find("DRJIT_SHFL")   != std::string::npos)
         printf("  note: uses wave ops; width-64 semantics NOT verified on NVIDIA (§7.2)\n");

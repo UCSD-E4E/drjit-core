@@ -8,6 +8,7 @@
 #pragma once
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <stdint.h>
 
 #define DRJIT_KERNEL extern "C" __global__
@@ -24,6 +25,10 @@
 #else
 #  define DRJIT_WARP_SIZE 32u
 #endif
+
+/* Half precision. gfx90a supports it natively, but the type is declared in a
+   header rather than being a builtin -- hence the include above. */
+#define DRJIT_HALF __half
 
 typedef uint64_t DRJIT_LANE_MASK_T;
 

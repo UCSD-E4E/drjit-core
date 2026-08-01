@@ -58,8 +58,15 @@ if (DRJIT_ENABLE_METAL)
 endif()
 
 if (DRJIT_ENABLE_HIP)
+  # Type mapping. Pure lookup, no device needed -- runs anywhere.
+  add_executable(hip_types hip_types.cpp)
+  set_property(TARGET hip_types PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_types PRIVATE drjit-core)
+  add_test(NAME hip_types COMMAND hip_types
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
   # Phase 0a invariants: the backend is registered but inert, and adding it
-  # perturbs nothing else. Expected to pass from the moment the wiring lands.
+  # perturbs nothing else.
   add_executable(hip_wiring hip_wiring.cpp)
   set_property(TARGET hip_wiring PROPERTY CXX_STANDARD 17)
   target_link_libraries(hip_wiring PRIVATE drjit-core)
