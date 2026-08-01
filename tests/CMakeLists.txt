@@ -90,6 +90,9 @@ if (DRJIT_ENABLE_HIP)
   # perturbs nothing else.
   add_executable(hip_wiring hip_wiring.cpp)
   set_property(TARGET hip_wiring PROPERTY CXX_STANDARD 17)
+  if (DRJIT_HIP_CUDA_SHIM)
+    target_compile_definitions(hip_wiring PRIVATE -DDRJIT_HIP_CUDA_SHIM=1)
+  endif()
   target_link_libraries(hip_wiring PRIVATE drjit-core)
   add_test(NAME hip_wiring COMMAND hip_wiring
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")

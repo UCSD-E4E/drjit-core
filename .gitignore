@@ -50,3 +50,4 @@ tests/microbenchmark
 build-hip/
 build-wiring/
 build-off/
+build-shim/

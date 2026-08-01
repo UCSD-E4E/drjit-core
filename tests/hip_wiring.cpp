@@ -50,8 +50,19 @@ int main(int, char **) {
     // enters state.backends and nothing downstream can dispatch to it. When
     // Phase 1 lands on real hardware this flips to 1 and the assertion below
     // must be updated deliberately, not silently.
+    //
+    // The CUDA shim (PLAN.md §0.3) deliberately breaks that contract: it backs
+    // the HIP backend with a real CUDA device so codegen can be exercised
+    // without AMD hardware, and the backend genuinely becomes available. So the
+    // expectation is inverted rather than dropped -- an inert backend under the
+    // shim would mean the scaffold silently stopped working.
+#if defined(DRJIT_HIP_CUDA_SHIM)
+    check(jit_has_backend(JitBackend::HIP) == 1,
+          "jit_has_backend(HIP) == 1 (CUDA shim active)");
+#else
     check(jit_has_backend(JitBackend::HIP) == 0,
           "jit_has_backend(HIP) == 0 (inert)");
+#endif
 
     // --- Adding a backend perturbs nothing else -----------------------------
     check(jit_has_backend(JitBackend::LLVM) == 1,

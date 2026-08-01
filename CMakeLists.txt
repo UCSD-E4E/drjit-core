@@ -32,6 +32,10 @@ if (NOT APPLE)
   # Phase 0a registers the backend but leaves it inert.
   option(DRJIT_ENABLE_HIP  "Enable the AMD HIP backend?" OFF)
   option(DRJIT_DYNAMIC_HIP "Resolve HIP dynamically at run time?" ON)
+  # Development scaffold (PLAN.md §0.3): back the HIP backend with the CUDA
+  # runtime so codegen can be exercised end to end on an NVIDIA GPU with no
+  # AMD hardware. Never enable in a real build.
+  option(DRJIT_HIP_CUDA_SHIM "Run the HIP backend on the CUDA runtime (DEV ONLY)?" OFF)
 endif()
 
 if (NOT MSVC)
@@ -369,6 +373,13 @@ if (DRJIT_ENABLE_HIP)
   target_compile_definitions(drjit-core PRIVATE -DDRJIT_ENABLE_HIP=1)
   if (DRJIT_DYNAMIC_HIP)
     target_compile_definitions(drjit-core PRIVATE -DDRJIT_DYNAMIC_HIP=1)
+  endif()
+  if (DRJIT_HIP_CUDA_SHIM)
+    if (NOT DRJIT_ENABLE_CUDA)
+      message(FATAL_ERROR "DRJIT_HIP_CUDA_SHIM requires DRJIT_ENABLE_CUDA.")
+    endif()
+    target_compile_definitions(drjit-core PRIVATE -DDRJIT_HIP_CUDA_SHIM=1)
+    message(STATUS "Dr.Jit-Core: HIP backend running on the CUDA SHIM (dev only).")
   endif()
 endif()
 
