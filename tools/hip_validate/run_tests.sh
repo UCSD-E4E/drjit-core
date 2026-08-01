@@ -58,5 +58,25 @@ if [ -x "$GEN" ]; then
   fi
 fi
 
+# --- The wave64/fp16 unverified list (PLAN.md §0.3, §7.2) -------------------
+#
+# The execution arm runs at warp 32 and aliases fp16 to float, so kernels that
+# touch either had their STRUCTURE checked but not their semantics. §7.2 asks
+# for a running list rather than a discovery at integration time, so the runner
+# prints one on every run instead of leaving it in prose.
+unver=""
+for k in "$DIR"/*.hip; do
+  if grep -qE "DRJIT_SHFL|DRJIT_BALLOT|DRJIT_ACTIVEMASK|DRJIT_WARP_SIZE|DRJIT_HALF" "$k" 2>/dev/null; then
+    unver="$unver $(basename "$k" .hip)"
+  fi
+done
+if [ -n "$unver" ]; then
+  echo
+  echo "  UNVERIFIED ON NVIDIA (re-run these first on the MI210):"
+  for u in $unver; do echo "    - $u"; done
+  echo "    reason: exec arm is warp-32 and aliases DRJIT_HALF to float"
+  echo
+fi
+
 echo "  ---- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
