@@ -236,6 +236,33 @@ Keep at least one negative case as coverage grows.
 with a throwaway program. `tests/hip_wiring.cpp` retrofits those invariants so
 they are at least permanent and repeatable. Do not repeat that pattern.
 
+### Known limit: opcode emission cannot be TDD'd until Phase 1
+
+`jitc_hip_assemble()` takes a `ThreadState` and a `ScheduledGroup`, and the only
+way to reach it is through `jitc_eval()` — which first needs `jit_malloc` for
+the backend, a live ThreadState, and scheduling. In other words **reaching
+codegen requires most of Phase 1**, which requires an MI210.
+
+A "codegen-only" mode that registers the backend without a device was
+considered and rejected: it is not a small hook, it would make
+`jit_has_backend(HIP)` lie, and every allocation path would need a fake.
+
+So the ladder is:
+
+- **Now, fully testable:** anything pure — the type tables
+  (`tests/hip_types.cpp`), the reindent pass (`tests/hip_format.cpp`). Build
+  these as pure functions in headers *specifically so* they stay testable
+  without JIT state or exported symbols.
+- **Now, testable as specification:** hand-write the source an opcode *should*
+  produce as a kernel under `kernels/` and validate it with `hip_validate`.
+  That proves the target shape compiles for gfx90a and computes the right
+  numbers, so when the emitter is written there is an unambiguous target.
+- **After Phase 1:** the emitter itself, end-to-end, via `tests/hip_codegen.cpp`.
+
+Prefer factoring emitter logic into pure helpers wherever it does not distort
+the design — every piece moved into that first category is a piece that gets
+tested months before the hardware arrives.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate

@@ -21,8 +21,11 @@
 */
 
 #include "hip.h"
+#include "hip_eval.h"
+#include "hip_format.h"
 #include "eval.h"
 #include "log.h"
+#include "strbuf.h"
 
 #if defined(DRJIT_ENABLE_HIP)
 
@@ -35,10 +38,15 @@ void jitc_hip_assemble(ThreadState * /*ts*/, ScheduledGroup /*group*/,
 
 void jitc_hip_assemble_reset() { }
 
+/// Scratch holding the formatted copy, so the main code buffer keeps the
+/// unformatted text. Mirrors metal_reindent_scratch.
+static std::string hip_reindent_scratch;
+
 const char *jitc_hip_format(size_t *size_out) {
+    hip_reindent_scratch = jitc_hip_reindent(buffer.get(), buffer.size());
     if (size_out)
-        *size_out = 0;
-    return "";
+        *size_out = hip_reindent_scratch.size();
+    return hip_reindent_scratch.c_str();
 }
 
 #endif // DRJIT_ENABLE_HIP

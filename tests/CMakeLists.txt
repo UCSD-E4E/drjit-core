@@ -65,6 +65,13 @@ if (DRJIT_ENABLE_HIP)
   add_test(NAME hip_types COMMAND hip_types
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
+  # Reindent pass. Pure string transform, no device and no JIT state.
+  add_executable(hip_format hip_format.cpp)
+  set_property(TARGET hip_format PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_format PRIVATE drjit-core)
+  add_test(NAME hip_format COMMAND hip_format
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
   # Phase 0a invariants: the backend is registered but inert, and adding it
   # perturbs nothing else.
   add_executable(hip_wiring hip_wiring.cpp)
