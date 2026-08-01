@@ -276,10 +276,24 @@ struct alignas(64) Variable {
     uint32_t kind : 7;
 
     /// Backend associated with this variable
-    uint32_t backend : 2;
+    ///
+    /// THREE bits, not two. This was 2 while there were four backends
+    /// (None/CUDA/LLVM/Metal, values 0-3); JitBackend::HIP = 4 does not fit and
+    /// truncates to 0 = None. The failure is silent and deeply confusing --
+    /// variables are created correctly, then thread_state() dispatches on a
+    /// backend of None and reports "the host backend is unavailable".
+    ///
+    /// The static_assert below turns adding a fifth backend from a debugging
+    /// session into a compile error.
+    uint32_t backend : 3;
 
     /// Variable type (Bool/Int/Float/....)
-    uint32_t type : 5;
+    ///
+    /// FOUR bits: VarType runs 0..15 (Float64 is the last real entry, Count is
+    /// a sentinel that is never stored -- verified). The fifth bit was slack,
+    /// and it was reclaimed to widen `backend` above without growing Variable
+    /// past the 64 bytes the assertion below pins.
+    uint32_t type : 4;
 
     /// Is this a pointer variable that tracks a pending write? It holds a side
     /// effect reference that keeps the target marked dirty until it expires.
@@ -374,6 +388,23 @@ struct alignas(64) Variable {
 };
 
 static_assert(sizeof(Variable) == 64);
+
+/// Adding a backend must not silently overflow Variable::backend.
+///
+/// It did exactly that when HIP was added: the field was 2 bits, HIP = 4
+/// truncated to 0 = None, and the symptom was thread_state() reporting "the
+/// host backend is unavailable" from a variable that had been created
+/// perfectly correctly. Nothing pointed at the bitfield. This turns the next
+/// occurrence into a compile error.
+static_assert((uint32_t) VarType::Count <= 16,
+              "Variable::type is 4 bits; the fifth was reclaimed for "
+              "Variable::backend. Widen it back (and find another spare bit) "
+              "before adding a 17th VarType.");
+
+static_assert((uint32_t) JitBackend::Count <= 8,
+              "Variable::backend is 3 bits wide and can no longer hold every "
+              "JitBackend value. Widen the field, then re-check the "
+              "sizeof(Variable) == 64 assertion above.");
 
 /// This record represents additional information that can *optionally* be
 /// associated with a 'Variable' instance. These are factored out into a struct
@@ -1253,6 +1284,9 @@ struct ThreadLocal {
 #if defined(DRJIT_ENABLE_METAL)
     ThreadState *ts_metal = nullptr;
 #endif
+#if defined(DRJIT_ENABLE_HIP)
+    ThreadState *ts_hip = nullptr;
+#endif
 
     // Compilation flags
     uint32_t flags = (uint32_t) JitFlag::Default;
@@ -1275,6 +1309,9 @@ struct ThreadLocal {
 #if defined(DRJIT_ENABLE_METAL)
 #  define thread_state_metal (tls.ts_metal)
 #endif
+#if defined(DRJIT_ENABLE_HIP)
+#  define thread_state_hip (tls.ts_hip)
+#endif
 #define jitc_flags_v      (tls.flags)
 #define default_backend   (tls.def_backend)
 
@@ -1296,6 +1333,12 @@ inline ThreadState *thread_state(JitBackend backend) {
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal:
             result = thread_state_metal;
+            break;
+#endif
+
+#if defined(DRJIT_ENABLE_HIP)
+        case JitBackend::HIP:
+            result = thread_state_hip;
             break;
 #endif
 
@@ -1384,6 +1427,20 @@ template <typename T> inline bool jitc_is_hip(T b) {
 
 template <typename T> inline bool jitc_is_llvm(T b) {
     return (JitBackend) b == JitBackend::LLVM;
+}
+
+/// True when a backend should take the CUDA allocation/launch path.
+///
+/// Under the CUDA shim (PLAN.md §0.3) the HIP backend is serviced by
+/// CUDAThreadState, so its memory must come from the CUDA allocator too. This
+/// exists so the shim needs one predicate change rather than a scattering of
+/// `|| jitc_is_hip(...)` at every malloc site.
+template <typename T> inline bool jitc_is_cuda_alloc(T b) {
+#if defined(DRJIT_HIP_CUDA_SHIM)
+    return jitc_is_cuda(b) || jitc_is_hip(b);
+#else
+    return jitc_is_cuda(b);
+#endif
 }
 
 /// Returns true if the given backend uses GPU device memory (CUDA, Metal or HIP)

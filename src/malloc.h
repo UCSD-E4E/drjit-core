@@ -47,6 +47,7 @@ inline const char *jitc_backend_name(JitBackend b) {
         case JitBackend::LLVM:  return "LLVM";
         case JitBackend::CUDA:  return "CUDA";
         case JitBackend::Metal: return "Metal";
+        case JitBackend::HIP:   return "HIP";
         default: return "?";
     }
 }

@@ -1,3 +1,5 @@
+#pragma once
+
 #include "internal.h"
 #include "log.h"
 

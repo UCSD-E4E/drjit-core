@@ -126,7 +126,7 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
     ThreadState *ts = nullptr;
     int device = 0;
 #if defined(DRJIT_ENABLE_CUDA)
-    if (jitc_is_cuda(backend)) {
+    if (jitc_is_cuda_alloc(backend)) {
         ts = thread_state(backend);
         device = ts->device;
     }
@@ -175,7 +175,7 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
 #endif
 
 #if defined(DRJIT_ENABLE_CUDA)
-                } else if (jitc_is_cuda(backend)) {
+                } else if (jitc_is_cuda_alloc(backend)) {
                     scoped_set_context guard_2(ts->context);
                     CUresult ret;
 
@@ -272,6 +272,9 @@ void jitc_free(void *ptr) {
     switch (backend) {
 #if defined(DRJIT_ENABLE_CUDA)
         case JitBackend::CUDA: ts = tl.ts_cuda; break;
+#if defined(DRJIT_ENABLE_HIP)
+        case JitBackend::HIP:  ts = tl.ts_hip;  break;
+#endif
 #endif
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal: ts = tl.ts_metal; break;
@@ -405,7 +408,7 @@ void* jitc_malloc_migrate(void *ptr, JitBackend dst_backend, int move) {
     }
 #endif
 #if defined(DRJIT_ENABLE_CUDA)
-    if (jitc_is_cuda(gpu_backend)) {
+    if (jitc_is_cuda_alloc(gpu_backend)) {
         scoped_set_context guard(ts->context);
         if (src_backend == JitBackend::None) {
             // Stage host -> device copies through a shared buffer

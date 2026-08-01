@@ -17,6 +17,7 @@
 #endif
 #if defined(DRJIT_ENABLE_HIP)
 #  include "hip.h"
+#  include "hip_ts.h"
 #endif
 #include "llvm_ts.h"
 #include "malloc.h"
@@ -479,6 +480,33 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
         ts->event = device.event;
         ts->sync_stream_event = device.sync_stream_event;
         thread_state_cuda = ts;
+#endif
+#if defined(DRJIT_ENABLE_HIP)
+    } else if (jitc_is_hip(backend)) {
+        if ((state.backends & (1u << (uint32_t) JitBackend::HIP)) == 0)
+            jitc_raise("jit_init_thread_state(): the HIP backend has not been "
+                       "initialized. Call jit_init(JitBackend::HIP) first.");
+        if (state.hip_devices.empty())
+            jitc_raise("jit_init_thread_state(): the HIP backend is inactive "
+                       "because no device was detected.");
+
+# if defined(DRJIT_HIP_CUDA_SHIM)
+        // Under the shim, HIPThreadState IS a CUDAThreadState (see hip_ts.h),
+        // so it needs the CUDA device's stream and events -- it will really
+        // submit work through them.
+        ts = new HIPThreadState();
+        CUDADevice &hd = state.devices[0];
+        ts->device = 0;
+        ts->context = hd.context;
+        ts->stream = hd.stream;
+        ts->event = hd.event;
+        ts->sync_stream_event = hd.sync_stream_event;
+# else
+        jitc_raise("jit_init_thread_state(): the HIP backend has no runtime "
+                   "layer yet (Phase 1). Build with -DDRJIT_HIP_CUDA_SHIM=ON "
+                   "to run HIP codegen on a CUDA device.");
+# endif
+        thread_state_hip = ts;
 #endif
     } else if (jitc_is_llvm(backend)) {
         ts = new LLVMThreadState();
