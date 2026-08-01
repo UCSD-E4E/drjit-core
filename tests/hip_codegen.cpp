@@ -130,6 +130,42 @@ int main(int, char **) {
         jit_var_dec_ref(clamped); jit_var_dec_ref(fl); jit_var_dec_ref(fl_eval);
     }
 
+    // ---- Gather --------------------------------------------------------------
+    //
+    // A REVERSING gather (index = N-1-i) rather than an identity one: with
+    // index == i, a backend that ignored the index entirely and returned the
+    // lane's own element would still pass. Reversal makes that failure visible.
+    {
+        uint32_t src  = jit_var_counter(JitBackend::HIP, N);       // 0..N-1
+        uint32_t nm1  = jit_var_u32(JitBackend::HIP, N - 1);
+        uint32_t idx  = jit_var_counter(JitBackend::HIP, N);
+
+        uint32_t sd[2] = { nm1, idx };
+        uint32_t rev = jit_var_op(JitOp::Sub, sd);                 // N-1-i
+
+        // Evaluate the source so the gather reads real memory rather than
+        // folding into the producing expression.
+        jit_var_eval(src);
+
+        uint32_t g = jit_var_gather(src, rev, jit_var_bool(JitBackend::HIP, true));
+
+        jit_var_eval(g);
+        void *gp = nullptr;
+        uint32_t g_eval = jit_var_data(g, &gp);
+
+        uint32_t hostg[N];
+        jit_memcpy(JitBackend::HIP, hostg, gp, sizeof(hostg));
+
+        bool ok = true;
+        for (uint32_t i = 0; i < N; ++i)
+            if (hostg[i] != (N - 1 - i))
+                ok = false;
+        check(ok, "reversing gather correct for all lanes");
+
+        jit_var_dec_ref(src); jit_var_dec_ref(nm1); jit_var_dec_ref(idx);
+        jit_var_dec_ref(rev); jit_var_dec_ref(g);   jit_var_dec_ref(g_eval);
+    }
+
     jit_shutdown(0);
 
     if (failures) {

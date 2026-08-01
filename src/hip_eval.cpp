@@ -259,6 +259,57 @@ static void jitc_hip_render(Variable *v) {
             break;
         }
 
+        // --- Memory -----------------------------------------------------------
+        //
+        // Dep layouts differ between the two and are NOT guessable, so they are
+        // taken from metal_eval.cpp / metal_scatter.cpp rather than inferred:
+        //
+        //   Gather:  dep[0]=src   dep[1]=index dep[2]=mask
+        //   Scatter: dep[0]=ptr   dep[1]=value dep[2]=index dep[3]=mask
+        //
+        // Note the masked gather is a TERNARY, not a load followed by a select.
+        // `?:` short-circuits, so the load genuinely does not execute on masked
+        // lanes; the two-statement form would read out of bounds on every one
+        // of them (spec_memory.hip).
+        case VarKind::Gather: {
+            Variable *src   = jitc_var(v->dep[0]);
+            Variable *index = jitc_var(v->dep[1]);
+            Variable *mask  = jitc_var(v->dep[2]);
+            bool unmasked = mask->is_literal() && mask->literal == 1;
+
+            if (unmasked)
+                fmt("$t $v = ((const $t *) $v)[$v];\n", v, v, v, src, index);
+            else
+                fmt("$t $v = ($v) ? ((const $t *) $v)[$v] : ($t) 0;\n",
+                    v, v, mask, v, src, index, v);
+            break;
+        }
+
+        case VarKind::Scatter: {
+            Variable *ptr   = jitc_var(v->dep[0]);
+            Variable *value = jitc_var(v->dep[1]);
+            Variable *index = jitc_var(v->dep[2]);
+            Variable *mask  = jitc_var(v->dep[3]);
+
+            ReduceOp op = (ReduceOp) (uint32_t) v->literal;
+            bool unmasked = mask->is_literal() && mask->literal == 1;
+
+            if (op != ReduceOp::Identity)
+                jitc_fail("jitc_hip_render(): scatter-reduce is not implemented "
+                          "yet. The atomic forms and their return-value "
+                          "conventions are specified in "
+                          "tools/hip_validate/kernels/spec_memory.hip; note "
+                          "they must target GLOBAL memory, never a "
+                          "materialised temporary.");
+
+            if (unmasked)
+                fmt("(($t *) $v)[$v] = $v;\n", value, ptr, index, value);
+            else
+                fmt("if ($v) (($t *) $v)[$v] = $v;\n",
+                    mask, value, ptr, index, value);
+            break;
+        }
+
         default:
             jitc_fail("jitc_hip_render(): unhandled variable kind \"%s\"! The "
                       "source this opcode must produce is specified in "
