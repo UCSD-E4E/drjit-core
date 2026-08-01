@@ -345,6 +345,29 @@ instinct: it would either fail on real hardware or set an expectation the MI210
 cannot meet. Accurate and approximate forms are checked at *different*
 tolerances on purpose — that asymmetry is the specification.
 
+## 11d. The next concrete blocker: `fmt_hip`
+
+`fmt` is not one function. `src/strbuf.cpp` carries a SEPARATE implementation per
+backend — `fmt_llvm`, `fmt_cuda`, `fmt_metal` — each with its type table baked
+into the `$t` / `$b` cases:
+
+```c
+case 't': cur = w_type(cur, type_name_llvm [v->type]); break;   // fmt_llvm
+case 't': cur = w_type(cur, type_name_ptx  [v->type]); break;   // fmt_cuda
+case 't': cur = w_type(cur, type_name_metal[v->type]); break;   // fmt_metal
+```
+
+So `jitc_hip_render()` cannot be written until `fmt_hip` exists, wired to
+`type_name_hip` / `type_name_hip_bin` (already implemented and tested in
+`src/hip_eval.h`). The work is mechanical — copy `fmt_metal`, swap the two
+tables, declare it in `strbuf.h` — but it is a genuine upstream-seam addition of
+roughly 150 lines, so it belongs in the §9 patch inventory rather than in a
+`hip_*` file we own.
+
+**Do this before attempting the emitter**, and note it is the one piece so far
+that could NOT be kept out of upstream files. Everything else has stayed in new
+`hip_*` sources or behind a one-line guard.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
