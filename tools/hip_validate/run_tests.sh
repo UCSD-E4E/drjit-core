@@ -58,6 +58,24 @@ if [ -x "$GEN" ]; then
   fi
 fi
 
+# --- Phase 1 API surface (HIP-on-CUDA, PLAN.md §3.5) ------------------------
+#
+# Built separately from the kernels: it uses the REAL HIP API and so needs the
+# nvcc toolchain rather than hip_validate. Proves the whole JIT pipeline
+# (hiprtc -> hipModuleLoadData -> hipModuleLaunchKernel) before hip_api.cpp is
+# written against it.
+if [ -n "${HIPNV_CFLAGS:-}" ] && command -v nvcc >/dev/null 2>&1; then
+  SRC="$(dirname "$0")/hipnv_pipeline.cpp"
+  if nvcc -x cu $HIPNV_CFLAGS -arch=sm_86 "$SRC" -o /tmp/hipnv_pipeline $HIPNV_LDFLAGS >/dev/null 2>&1 &&
+     LD_LIBRARY_PATH="${CUDART_LIB}:${NVRTC_LIB}:$LD_LIBRARY_PATH" /tmp/hipnv_pipeline >/dev/null 2>&1; then
+    printf "  %-20s PASS  (real HIP API on NVIDIA)\n" "hipnv_pipeline"
+    pass=$((pass+1))
+  else
+    printf "  %-20s FAIL  (Phase 1 API surface broken)\n" "hipnv_pipeline"
+    fail=$((fail+1))
+  fi
+fi
+
 # --- The wave64/fp16 unverified list (PLAN.md §0.3, §7.2) -------------------
 #
 # The execution arm runs at warp 32 and aliases fp16 to float, so kernels that
