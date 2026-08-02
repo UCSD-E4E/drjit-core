@@ -135,6 +135,7 @@
 #include "profile.h"
 #include "util.h"
 #include "var.h"
+#include <functional>
 
 const char *op_type_name[(int) OpType::Count]{
     "Barrier",        "KernelLaunch",      "MemsetAsync",          "Expand",
@@ -2677,6 +2678,53 @@ void unset_disabled_thread_state(ThreadState **tsp) {
     }
 }
 
+/// Every thread-state slot that exists in this build, paired with its backend.
+///
+/// Freezing swaps one slot for a RecordThreadState and disables the rest, then
+/// undoes that in three places (stop, abort, and the error path). Written as a
+/// per-backend if/else chain, that is one arm per backend PER SITE, and a
+/// missing arm does not fail where it is missing: the backend silently falls
+/// into the trailing `else`, which assigns the recorder to the LLVM slot. HIP
+/// did exactly that, and the symptom appeared later as "no recording was
+/// started for this backend" from jit_freeze_stop().
+///
+/// Enumerating the slots once removes the whole class -- a new backend adds one
+/// line here rather than an arm in each of six chains.
+static void for_each_thread_state_slot(
+    const std::function<void(JitBackend, ThreadState **)> &f) {
+    f(JitBackend::LLVM, &thread_state_llvm);
+#if defined(DRJIT_ENABLE_CUDA)
+    f(JitBackend::CUDA, &thread_state_cuda);
+#endif
+#if defined(DRJIT_ENABLE_METAL)
+    f(JitBackend::Metal, &thread_state_metal);
+#endif
+#if defined(DRJIT_ENABLE_HIP)
+    f(JitBackend::HIP, &thread_state_hip);
+#endif
+}
+
+/// Install `record_ts` in `backend`'s slot and disable every other backend for
+/// the duration of the recording.
+static void swap_in_record_ts(JitBackend backend, ThreadState *record_ts) {
+    for_each_thread_state_slot([&](JitBackend b, ThreadState **slot) {
+        if (b == backend)
+            *slot = record_ts;
+        else
+            set_disabled_thread_state(slot, backend);
+    });
+}
+
+/// The inverse: restore `internal` and re-enable the others.
+static void swap_out_record_ts(JitBackend backend, ThreadState *internal) {
+    for_each_thread_state_slot([&](JitBackend b, ThreadState **slot) {
+        if (b == backend)
+            *slot = internal;
+        else
+            unset_disabled_thread_state(slot);
+    });
+}
+
 /// Remove a recording thread state from the compaction registry
 static void jitc_record_ts_forget(ThreadState *ts) {
     std::vector<ThreadState *> &r = state.record_tss;
@@ -2713,33 +2761,7 @@ void jitc_freeze_start(JitBackend backend, const uint32_t *inputs,
     RecordThreadState *record_ts = new RecordThreadState(ts_);
     state.record_tss.push_back(record_ts);
 
-#if defined(DRJIT_ENABLE_CUDA)
-    if (jitc_is_cuda(backend)) {
-        thread_state_cuda = record_ts;
-        set_disabled_thread_state(&thread_state_llvm, backend);
-#if defined(DRJIT_ENABLE_METAL)
-        set_disabled_thread_state(&thread_state_metal, backend);
-#endif
-    } else
-#endif
-#if defined(DRJIT_ENABLE_METAL)
-    if (jitc_is_metal(backend)) {
-        thread_state_metal = record_ts;
-#if defined(DRJIT_ENABLE_CUDA)
-        set_disabled_thread_state(&thread_state_cuda, backend);
-#endif
-        set_disabled_thread_state(&thread_state_llvm, backend);
-    } else
-#endif
-    {
-        thread_state_llvm = record_ts;
-#if defined(DRJIT_ENABLE_CUDA)
-        set_disabled_thread_state(&thread_state_cuda, backend);
-#endif
-#if defined(DRJIT_ENABLE_METAL)
-        set_disabled_thread_state(&thread_state_metal, backend);
-#endif
-    }
+    swap_in_record_ts(backend, record_ts);
 
     for (uint32_t i = 0; i < n_inputs; ++i)
         record_ts->add_input(inputs[i]);
@@ -2768,33 +2790,7 @@ Recording *jitc_freeze_stop(JitBackend backend, const uint32_t *outputs,
 
         // Restore the active thread state *before* the recording exception is
         // rethrown below.
-#if defined(DRJIT_ENABLE_CUDA)
-        if (jitc_is_cuda(backend)) {
-            thread_state_cuda = internal;
-            unset_disabled_thread_state(&thread_state_llvm);
-#if defined(DRJIT_ENABLE_METAL)
-            unset_disabled_thread_state(&thread_state_metal);
-#endif
-        } else
-#endif
-#if defined(DRJIT_ENABLE_METAL)
-        if (jitc_is_metal(backend)) {
-            thread_state_metal = internal;
-#if defined(DRJIT_ENABLE_CUDA)
-            unset_disabled_thread_state(&thread_state_cuda);
-#endif
-            unset_disabled_thread_state(&thread_state_llvm);
-        } else
-#endif
-        {
-            thread_state_llvm = internal;
-#if defined(DRJIT_ENABLE_CUDA)
-            unset_disabled_thread_state(&thread_state_cuda);
-#endif
-#if defined(DRJIT_ENABLE_METAL)
-            unset_disabled_thread_state(&thread_state_metal);
-#endif
-        }
+        swap_out_record_ts(backend, internal);
 
         if (rts->m_exception)
             std::rethrow_exception(rts->m_exception);
@@ -2832,33 +2828,7 @@ void jitc_freeze_abort(JitBackend backend) {
         // variables
         internal->scope = rts->scope;
 
-#if defined(DRJIT_ENABLE_CUDA)
-        if (jitc_is_cuda(backend)) {
-            thread_state_cuda = internal;
-            unset_disabled_thread_state(&thread_state_llvm);
-#if defined(DRJIT_ENABLE_METAL)
-            unset_disabled_thread_state(&thread_state_metal);
-#endif
-        } else
-#endif
-#if defined(DRJIT_ENABLE_METAL)
-        if (jitc_is_metal(backend)) {
-            thread_state_metal = internal;
-#if defined(DRJIT_ENABLE_CUDA)
-            unset_disabled_thread_state(&thread_state_cuda);
-#endif
-            unset_disabled_thread_state(&thread_state_llvm);
-        } else
-#endif
-        {
-            thread_state_llvm = internal;
-#if defined(DRJIT_ENABLE_CUDA)
-            unset_disabled_thread_state(&thread_state_cuda);
-#endif
-#if defined(DRJIT_ENABLE_METAL)
-            unset_disabled_thread_state(&thread_state_metal);
-#endif
-        }
+        swap_out_record_ts(backend, internal);
 
         internal->recording_mode = KernelRecordingMode::Inactive;
         jitc_set_flag(JitFlag::FreezingScope, false);

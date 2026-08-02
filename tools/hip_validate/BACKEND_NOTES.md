@@ -506,15 +506,11 @@ Two are worth carrying forward as patterns rather than incidents:
 | `test_mem` | 17/17 |
 | `test_reductions` | 14/14 |
 | `test_vcall` | 14/14 |
+| `test_record` | 9/9 |
 | `test_array` | skipped — `VarKind::Array` |
-| `test_record` | skipped — frozen-function recording |
 
-The remaining skips are listed in `tests/test.cpp` and PRINT their reason on
-every run. Delete an entry when the subsystem lands.
-
-(`test14_frozen_vcall` returns early on HIP: it is the one test in that suite
-about recording rather than calls, and losing the other 13 to an unrelated gap
-would be the wrong trade. The early return is annotated in place.)
+The one remaining skip is listed in `tests/test.cpp` and PRINTS its reason on
+every run. Delete the entry when the subsystem lands.
 
 ### `test_graphviz` fails, and it is not ours
 

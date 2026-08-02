@@ -366,8 +366,7 @@ int main(int argc, char **argv) {
         // subsystem lands; the suite will then either pass or say what broke.
         if (test_hip) {
             static const struct { const char *suite, *reason; } hip_todo[] = {
-                { "array",  "VarKind::Array (local arrays)" },
-                { "record", "frozen-function recording (jit_freeze_start)" }
+                { "array",  "VarKind::Array (local arrays)" }
             };
             for (const auto &e : hip_todo) {
                 if (strcmp(TEST_NAME, e.suite) == 0) {
