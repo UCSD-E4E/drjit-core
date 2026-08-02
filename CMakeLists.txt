@@ -190,6 +190,7 @@ if (DRJIT_ENABLE_HIP)
     src/hip_format.h
     src/hip_codegen.h
     src/hip_eval.h
+    src/hip_preamble.h
     src/hip_eval.cpp)
 endif()
 

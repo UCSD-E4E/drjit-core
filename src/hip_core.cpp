@@ -32,6 +32,8 @@
 #include "cuda.h"
 #include <dlfcn.h>
 #include <vector>
+#include <string>
+#include <cstdlib>
 #include <utility>
 
 #if defined(DRJIT_ENABLE_HIP)
@@ -166,9 +168,41 @@ std::pair<void *, bool> jitc_hip_compile(const char *source) {
 
     // The real backend passes --offload-arch=<gfx>; only the option spelling
     // differs, not the shape of the call.
-    const char *opts[] = { "--gpu-architecture=compute_86", "--std=c++17" };
+    std::vector<const char *> opts{ "--gpu-architecture=compute_86",
+                                   "--std=c++17" };
 
-    if (nv_CompileProgram(prog, 2, opts)) {
+    // Half precision on the shim arm.
+    //
+    // NVRTC rejects `_Float16` (which is what gfx90a uses) and starts with an
+    // EMPTY include search list, so <cuda_fp16.h> is unreachable unless we
+    // point at it. Without it the preamble has to fall back to `typedef float
+    // f16`, and that is not merely imprecise -- it is four bytes wide, so every
+    // load from a half buffer reads the wrong element. Aliasing is fine for a
+    // compile check and wrong for execution.
+    //
+    // The path is supplied by the environment (the `#hip` dev shell sets it)
+    // rather than baked in, because there is no way to derive it: the headers
+    // live in a different package from the libnvrtc we dlopen.
+    std::string inc_opt;
+    const char *cuda_inc = getenv("DRJIT_HIP_SHIM_CUDA_INCLUDE");
+    if (cuda_inc && *cuda_inc) {
+        inc_opt = std::string("-I") + cuda_inc;
+        opts.push_back(inc_opt.c_str());
+        opts.push_back("-DDRJIT_SHIM_HAVE_FP16=1");
+    } else {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            jitc_log(Warn,
+                     "jit_hip_compile(): DRJIT_HIP_SHIM_CUDA_INCLUDE is unset, "
+                     "so <cuda_fp16.h> is unreachable and Float16 falls back to "
+                     "a 4-byte float. Kernels touching half precision will read "
+                     "the wrong elements. Set it to the directory containing "
+                     "cuda_fp16.h.");
+        }
+    }
+
+    if (nv_CompileProgram(prog, (int) opts.size(), opts.data())) {
         size_t log_size = 0;
         nv_GetProgramLogSize(prog, &log_size);
         std::vector<char> log(log_size + 1, 0);

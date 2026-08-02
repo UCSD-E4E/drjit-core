@@ -91,5 +91,24 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     double r27 = r26 - r24;
     if (!(r27 < 1e-8 && r27 > -1e-8)) err |= 1u << 13;
 
+    // --- Bitcast between two INTEGERS is a plain cast ------------------------
+    //
+    // Not every Bitcast involves a float. Int64 -> UInt64 and Int32 -> UInt32
+    // are pure reinterpretations that C++ already expresses exactly, and
+    // routing them through __float_as_uint (or any other float intrinsic)
+    // converts the VALUE first: 6 becomes 0x40c00000, the bits of 6.0f. That
+    // compiles, runs, and is wrong for every input.
+    int64_t  r28 = 6;
+    uint64_t r29 = (uint64_t) r28;
+    if (r29 != 6ull) err |= 1u << 14;
+
+    int64_t  r30 = -1;
+    uint64_t r31 = (uint64_t) r30;
+    if (r31 != 0xffffffffffffffffull) err |= 1u << 15;
+
+    int32_t  r32 = -2;
+    uint32_t r33 = (uint32_t) r32;
+    if (r33 != 0xfffffffeu) err |= 1u << 16;
+
     out[r0] = (float) err;
 }

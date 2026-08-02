@@ -57,8 +57,16 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     uint32_t r13 = (uint32_t) __clz(r2);             // Clz
     if (r13 != 0u) err |= 1u << 7;
 
-    uint32_t r14 = (uint32_t) (__ffs(r2) - 1);               // Ctz (via __ffs)
+    // Ctz is clz(brev(x)), NOT __ffs(x) - 1. The two agree everywhere except
+    // at zero, where __ffs returns 0 and the subtraction wraps to UINT_MAX,
+    // while Dr.Jit's constant folding defines ctz(0) as the bit width. A
+    // backend disagreeing with the folder produces results that depend on
+    // whether a value happened to be known at trace time.
+    uint32_t r14 = (uint32_t) __clz(__brev(r2));             // Ctz
     if (r14 != 4u) err |= 1u << 8;
+
+    uint32_t r14z = (uint32_t) __clz(__brev(0u));            // Ctz(0)
+    if (r14z != 32u) err |= 1u << 18;
 
     // Clz of 1 is 31 on a 32-bit type -- guards against a 64-bit builtin
     // being selected by accident.
@@ -83,6 +91,58 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     double   r21 = 1.0;
     uint64_t r22 = (uint64_t) __double_as_longlong(r21);
     if (r22 != 0x3ff0000000000000ull) err |= 1u << 12;
+
+    // --- The shapes the emitter actually produces ---------------------------
+    //
+    // Above this line each construct is checked in isolation. Dr.Jit emits
+    // Not/And/Or/Xor on floats as a single COMPOSED expression, and the
+    // composition is where it goes wrong: an `f32` spelling anywhere in the
+    // chain either fails to compile (`~` on a float) or silently rounds.
+
+    // Not, on a float. Inverting all bits of 1.0f gives a specific pattern;
+    // OR-ing the two binary views back together must set every bit.
+    float    r23 = 1.0f;
+    float    r24 = __uint_as_float(~(uint32_t) __float_as_uint(r23));
+    if ((__float_as_uint(r23) | __float_as_uint(r24)) != 0xffffffffu)
+        err |= 1u << 13;
+
+    // And / Or, on floats, through the binary view. Masking off the sign bit
+    // of -2.0f is fabsf; setting it on 2.0f is negation. Done in f32 these
+    // would not compile at all.
+    float r25 = -2.0f, r26 = __uint_as_float(0x7fffffffu);   // sign-bit mask
+    float r27 = __uint_as_float((uint32_t) __float_as_uint(r25) &
+                                (uint32_t) __float_as_uint(r26));
+    if (r27 != 2.0f) err |= 1u << 14;
+
+    float r28 = 2.0f, r29 = __uint_as_float(0x80000000u);
+    float r30 = __uint_as_float((uint32_t) __float_as_uint(r28) |
+                                (uint32_t) __float_as_uint(r29));
+    if (r30 != -2.0f) err |= 1u << 15;
+
+    // Not, on a bool, is `!` -- NOT `~`. `~true` is 0xfe, which converts back
+    // to `true`, so a bit-wise spelling here is not merely unidiomatic: it
+    // makes the operation a no-op.
+    bool r31 = true;
+    bool r32 = !r31;
+    if (r32) err |= 1u << 16;
+
+    // An all-ones word derived from the binary view, which is what Or against
+    // a set mask selects. `~(u8) 0` must survive the round trip to bool.
+    bool r33 = (bool) ~(uint8_t) 0;
+    if (!r33) err |= 1u << 17;
+
+    // --- 64-bit bit counting -------------------------------------------------
+    //
+    // Distinct intrinsics, not overloads. The 32-bit spelling applied to a
+    // 64-bit value examines only the low half and compiles without complaint:
+    // __clz(1ull << 40) is 31, not 23.
+    uint64_t r34 = 0xf0f0f0f0f0f0f0f0ull;
+    if ((uint32_t) __popcll(r34) != 32u)  err |= 1u << 19;
+    if ((uint32_t) __clzll(r34)  != 0u)   err |= 1u << 20;
+    if ((uint32_t) __clzll(1ull) != 63u)  err |= 1u << 21;
+    if (__brevll(1ull) != 0x8000000000000000ull) err |= 1u << 22;
+    if ((uint32_t) __clzll(__brevll(r34)) != 4u)   err |= 1u << 23;  // Ctz64
+    if ((uint32_t) __clzll(__brevll(0ull)) != 64u) err |= 1u << 24;  // Ctz64(0)
 
     out[r0] = (float) err;
 }

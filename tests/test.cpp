@@ -282,6 +282,7 @@ int main(int argc, char **argv) {
 
     int log_level_stderr = (int) LogLevel::Warn;
     bool test_cuda = true, test_optix = true, test_llvm = true, test_metal = true,
+         test_hip = true,
          check_test_files = false, write_ref = false, help = false;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-t") == 0) {
@@ -294,18 +295,28 @@ int main(int argc, char **argv) {
             test_llvm = false;
             test_optix = false;
             test_metal = false;
+            test_hip = false;
         } else if (strcmp(argv[i], "-l") == 0) {
             test_cuda = false;
             test_optix = false;
             test_metal = false;
+            test_hip = false;
         } else if (strcmp(argv[i], "-o") == 0) {
             test_cuda = false;
             test_llvm = false;
             test_metal = false;
+            test_hip = false;
         } else if (strcmp(argv[i], "-m") == 0) {
             test_cuda = false;
             test_llvm = false;
             test_optix = false;
+            test_hip = false;
+        } else if (strcmp(argv[i], "-r") == 0) {
+            // -r for ROCm; -h is taken by --help.
+            test_cuda = false;
+            test_llvm = false;
+            test_optix = false;
+            test_metal = false;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             help = true;
         } else {
@@ -323,6 +334,7 @@ int main(int argc, char **argv) {
         printf(" -l   Only run LLVM tests\n\n");
         printf(" -o   Only run OptiX tests\n\n");
         printf(" -m   Only run Metal tests\n\n");
+        printf(" -r   Only run HIP (ROCm) tests\n\n");
         printf(" -v   Be more verbose (can be repeated)\n\n");
         printf(" -t   Compare output against tests files\n\n");
         printf(" -w   Write reference test output to tests/out_*.\n\n");
@@ -333,12 +345,14 @@ int main(int argc, char **argv) {
         jit_set_log_level_stderr((LogLevel) log_level_stderr);
         jit_init((test_llvm ? (1u << (uint32_t) JitBackend::LLVM) : 0u) |
                  ((test_cuda || test_optix) ? (1u << (uint32_t) JitBackend::CUDA) : 0u) |
-                 (test_metal ? (1u << (uint32_t) JitBackend::Metal) : 0u));
+                 (test_metal ? (1u << (uint32_t) JitBackend::Metal) : 0u) |
+                 (test_hip ? (1u << (uint32_t) JitBackend::HIP) : 0u));
         fprintf(stdout, "\n");
 
         test_cuda &= (bool) jit_has_backend(JitBackend::CUDA);
         test_llvm &= (bool) jit_has_backend(JitBackend::LLVM);
         test_metal &= (bool) jit_has_backend(JitBackend::Metal);
+        test_hip &= (bool) jit_has_backend(JitBackend::HIP);
 
 #if defined(DRJIT_ENABLE_OPTIX)
         test_optix &= (bool) jit_has_backend(JitBackend::CUDA);
@@ -364,12 +378,14 @@ int main(int argc, char **argv) {
             bool is_cuda = strstr(test.name, "_cuda"),
                  is_llvm = strstr(test.name, "_llvm"),
                  is_optix = strstr(test.name, "_optix"),
-                 is_metal = strstr(test.name, "_metal");
+                 is_metal = strstr(test.name, "_metal"),
+                 is_hip = strstr(test.name, "_hip");
 
             if ((is_cuda && !test_cuda) ||
                 (is_optix && !test_optix) ||
                 (is_llvm && !test_llvm) ||
-                (is_metal && !test_metal)) {
+                (is_metal && !test_metal) ||
+                (is_hip && !test_hip)) {
                 fprintf(stdout, "skipped.\n");
                 continue;
             }
@@ -377,6 +393,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
             log_value.clear();
             jit_init(1u << (uint32_t)(is_metal ? JitBackend::Metal
+                                              : is_hip ? JitBackend::HIP
                                               : (is_cuda || is_optix) ? JitBackend::CUDA
                                                                       : JitBackend::LLVM));
 #if defined(DRJIT_ENABLE_OPTIX)

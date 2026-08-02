@@ -456,7 +456,7 @@ struct VariableKey {
         memcpy((void *) this, (const void *) &v.scope, 32);
         uint32_t array_length =
             (v.is_array() || v.coop_vec) ? (uint32_t) v.array_length : 0u;
-        // The bitfields kind:7|backend:2|type:5|write_ptr:1|written:1 occupy
+        // The bitfields kind:7|backend:3|type:4|write_ptr:1|written:1 occupy
         // bits 0..15 of the 32-bit word immediately after 'scratch' (LSB-first
         // packing), which is exactly the layout 'packed' wants. Reading the raw
         // word and masking avoids extracting and re-assembling each field

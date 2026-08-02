@@ -287,7 +287,9 @@ void jitc_shutdown(int light) {
                         " - id=%u: size=%u, type=%s, dep=[%u, "
                         "%u, %u, %u]",
                         kv.second, kv.first.size,
-                        type_name[(kv.first.packed >> 9) & 0x1f],
+                        // kind:7 | backend:3 | type:4 -- type starts at bit 10.
+                        // (It was bit 9 while 'backend' was 2 bits wide.)
+                        type_name[(kv.first.packed >> 10) & 0xf],
                         kv.first.dep[0], kv.first.dep[1], kv.first.dep[2],
                         kv.first.dep[3]);
 
@@ -307,6 +309,9 @@ void jitc_shutdown(int light) {
 #endif
 #if defined(DRJIT_ENABLE_METAL)
     tl.ts_metal = nullptr;
+#endif
+#if defined(DRJIT_ENABLE_HIP)
+    tl.ts_hip = nullptr;
 #endif
 
     if (jitc_log_active(LogLevel::Warn) && state.leak_warnings) {
@@ -646,6 +651,9 @@ void jitc_sync_thread() {
     jitc_sync_thread(tl.ts_llvm);
 #if defined(DRJIT_ENABLE_METAL)
     jitc_sync_thread(tl.ts_metal);
+#endif
+#if defined(DRJIT_ENABLE_HIP)
+    jitc_sync_thread(tl.ts_hip);
 #endif
 }
 

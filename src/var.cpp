@@ -749,6 +749,12 @@ uint32_t jitc_var_new(Variable &v, bool disable_lvn) {
 #if defined(DRJIT_ENABLE_METAL)
         case JitBackend::Metal: ts = tl.ts_metal; break;
 #endif
+#if defined(DRJIT_ENABLE_HIP)
+        // Omitting this arm does not fail loudly: jitc_init_thread_state() is
+        // called for *every* variable, each one getting a fresh scope, which
+        // silently disables local value numbering. It shows up as CSE misses.
+        case JitBackend::HIP:   ts = tl.ts_hip;   break;
+#endif
         case JitBackend::LLVM:  ts = tl.ts_llvm;  break;
         default:                ts = nullptr;      break;
     }
@@ -1555,6 +1561,10 @@ uint32_t jitc_var_eval_force(uint32_t index, Variable &v_, void **ptr_out) {
 #if defined(DRJIT_ENABLE_METAL)
         if (tl.ts_metal)
             tl.ts_metal->notify_init_undefined(result);
+#endif
+#if defined(DRJIT_ENABLE_HIP)
+        if (tl.ts_hip)
+            tl.ts_hip->notify_init_undefined(result);
 #endif
     }
 

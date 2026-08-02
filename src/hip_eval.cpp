@@ -96,6 +96,53 @@ static bool is_f64(const Variable *v) {
     return (VarType) v->type == VarType::Float64;
 }
 
+/// Intrinsics that move a value to and from its binary view (type_name_hip_bin).
+///
+/// PTX applies `and`/`or`/`xor`/`not` to a register's bits whatever the type
+/// declares, so the CUDA backend needs no conversion. HIP C++ has no such
+/// escape hatch -- `~x` on a float does not compile -- so bit-wise ops on
+/// floating point have to be routed through these. Integers need no call: an
+/// explicit `($b)` / `($t)` cast is exact and these return nullptr there.
+/// Both spellings are checked on gfx90a and NVIDIA by spec_bitwise.hip.
+/// Float16 has no such intrinsic pair that is spelled the same on both
+/// platforms, so it goes through helpers the preamble defines instead.
+static const char *to_bits_fn(const Variable *v) {
+    switch ((VarType) v->type) {
+        case VarType::Float16: return "drjit_half_to_bits";
+        case VarType::Float32: return "__float_as_uint";
+        case VarType::Float64: return "__double_as_longlong";
+        default:               return nullptr;
+    }
+}
+
+static const char *from_bits_fn(const Variable *v) {
+    switch ((VarType) v->type) {
+        case VarType::Float16: return "DRJIT_HALF_FROM_BITS";
+        case VarType::Float32: return "__uint_as_float";
+        case VarType::Float64: return "__longlong_as_double";
+        default:               return nullptr;
+    }
+}
+
+/// Pick the 32- or 64-bit spelling of a bit-manipulation intrinsic by operand
+/// width. These are distinct functions on both platforms, and the narrow one
+/// applied to a wide value truncates rather than failing to compile.
+static void render_width(Variable *v, const char *n32, const char *n64) {
+    render_call(v, type_size[v->type] == 8 ? n64 : n32, 1);
+}
+
+/// Bit-wise `op` on two same-typed operands, via the binary view when needed.
+static void render_bitwise(Variable *v, const char *op) {
+    Variable *a0 = jitc_var(v->dep[0]),
+             *a1 = jitc_var(v->dep[1]);
+
+    if (jitc_is_float(v))
+        fmt("$t $v = $s(($b) $s($v) $s ($b) $s($v));\n", v, v,
+            from_bits_fn(v), v, to_bits_fn(v), a0, op, v, to_bits_fn(v), a1);
+    else
+        fmt("$t $v = $v $s $v;\n", v, v, a0, op, a1);
+}
+
 /// Emit a math call, choosing the double or float spelling by operand type.
 /// `base` is the double name; the float form is `base` + "f".
 static void render_math(Variable *v, const char *base, uint32_t n_args = 1) {
@@ -133,16 +180,30 @@ static void jitc_hip_render(Variable *v) {
             fmt("$t $v = -$v;\n", v, v, jitc_var(v->dep[0]));
             break;
 
-        case VarKind::Not:
-            fmt("$t $v = ~$v;\n", v, v, jitc_var(v->dep[0]));
+        case VarKind::Not: {
+            Variable *a = jitc_var(v->dep[0]);
+            // `~` on a Bool is NOT logical negation: it yields 0xfe, which
+            // converts straight back to `true`, so the operation silently
+            // becomes a no-op rather than failing (spec_bitwise.hip bit 16).
+            if ((VarType) v->type == VarType::Bool)
+                fmt("$t $v = !$v;\n", v, v, a);
+            else if (jitc_is_float(v))
+                fmt("$t $v = $s(~($b) $s($v));\n", v, v, from_bits_fn(v), v,
+                    to_bits_fn(v), a);
+            else
+                fmt("$t $v = ~$v;\n", v, v, a);
             break;
+        }
 
+        // The `f` suffix is not cosmetic: fabsf/sqrtf on a Float64 round-trip
+        // through single precision and silently lose the bottom 29 bits.
         case VarKind::Abs:
-            render_call(v, jitc_is_float(v) ? "fabsf" : "abs", 1);
+            if (jitc_is_float(v)) render_math(v, "fabs");
+            else                  render_call(v, "abs", 1);
             break;
 
         case VarKind::Sqrt:
-            render_call(v, "sqrtf", 1);
+            render_math(v, "sqrt");
             break;
 
         // --- Binary ---------------------------------------------------------
@@ -151,9 +212,36 @@ static void jitc_hip_render(Variable *v) {
         case VarKind::Mul: render_binary(v, "*"); break;
         case VarKind::Div: render_binary(v, "/"); break;
         case VarKind::Mod: render_binary(v, "%"); break;
-        case VarKind::And: render_binary(v, "&"); break;
-        case VarKind::Or:  render_binary(v, "|"); break;
-        case VarKind::Xor: render_binary(v, "^"); break;
+        // A mismatched operand type means the second argument is a Bool mask
+        // rather than a value to combine bit-wise -- Dr.Jit spells `select`
+        // that way. The CUDA backend detects the same case and emits `selp`.
+        case VarKind::And: {
+            Variable *a0 = jitc_var(v->dep[0]),
+                     *a1 = jitc_var(v->dep[1]);
+            if (a0->type != a1->type)
+                fmt("$t $v = $v ? $v : ($t) 0;\n", v, v, a1, a0, v);
+            else
+                render_bitwise(v, "&");
+            break;
+        }
+
+        case VarKind::Or: {
+            Variable *a0 = jitc_var(v->dep[0]),
+                     *a1 = jitc_var(v->dep[1]);
+            if (a0->type != a1->type) {
+                // A set mask selects an all-ones word: the identity of OR.
+                if (jitc_is_float(v))
+                    fmt("$t $v = $v ? $s(~($b) 0) : $v;\n", v, v, a1,
+                        from_bits_fn(v), v, a0);
+                else
+                    fmt("$t $v = $v ? ($t) ~($b) 0 : $v;\n", v, v, a1, v, v, a0);
+            } else {
+                render_bitwise(v, "|");
+            }
+            break;
+        }
+
+        case VarKind::Xor: render_bitwise(v, "^"); break;
         case VarKind::Shl: render_binary(v, "<<"); break;
         case VarKind::Shr: render_binary(v, ">>"); break;
 
@@ -172,9 +260,17 @@ static void jitc_hip_render(Variable *v) {
             break;
 
         case VarKind::Fma:
-            // Must be the fused form: a * b + c would silently differ in
-            // precision from the CUDA backend (spec_arith.hip).
-            render_call(v, jitc_is_float(v) ? "fmaf" : "__mad", 3);
+            // Floats must use the fused form: a * b + c would silently differ
+            // in precision from the CUDA backend (spec_arith.hip).
+            //
+            // Integers must NOT. There is no __mad on either platform, and
+            // nothing to fuse: the multiply is exact modulo the type width, so
+            // no precision exists for the add to recover.
+            if (jitc_is_float(v))
+                render_math(v, "fma", 3);
+            else
+                fmt("$t $v = $v * $v + $v;\n", v, v, jitc_var(v->dep[0]),
+                    jitc_var(v->dep[1]), jitc_var(v->dep[2]));
             break;
 
         case VarKind::Min:
@@ -217,22 +313,35 @@ static void jitc_hip_render(Variable *v) {
         case VarKind::DivApprox:   render_call(v, "__fdividef", 2); break;
 
         // --- Bit counting -----------------------------------------------------
-        case VarKind::Popc: render_call(v, "__popc", 1); break;
-        case VarKind::Clz:  render_call(v, "__clz", 1);  break;
-        case VarKind::Brev: render_call(v, "__brev", 1); break;
+        //
+        // 32- and 64-bit forms are DIFFERENT intrinsics, not overloads: the
+        // 32-bit spelling applied to a 64-bit value narrows it silently and
+        // still compiles (spec_bitwise.hip).
+        case VarKind::Popc: render_width(v, "__popc", "__popcll"); break;
+        case VarKind::Clz:  render_width(v, "__clz",  "__clzll");  break;
+        case VarKind::Brev: render_width(v, "__brev", "__brevll"); break;
 
-        case VarKind::Ctz:
-            // No __ctz exists on either platform; __ffs is 1-based.
-            fmt("$t $v = ($t) (__ffs($v) - 1);\n", v, v, v,
-                jitc_var(v->dep[0]));
+        case VarKind::Ctz: {
+            // No __ctz exists on either platform. `__ffs(x) - 1` is the obvious
+            // substitute and is wrong at zero: __ffs returns 0, the subtraction
+            // wraps, and the result disagrees with Dr.Jit's constant folder,
+            // which defines ctz(0) as the bit width. clz(brev(x)) gives that
+            // for free -- and is what the CUDA backend emits.
+            bool wide = type_size[v->type] == 8;
+            fmt("$t $v = $s($s($v));\n", v, v, wide ? "__clzll" : "__clz",
+                wide ? "__brevll" : "__brev", jitc_var(v->dep[0]));
             break;
+        }
 
         // --- Wide multiplication ----------------------------------------------
         //
         // These exist as opcodes precisely because `a * b` is computed modulo
         // the operand width, discarding what they need (spec_mulwide.hip).
         case VarKind::MulHi:
-            render_call(v, jitc_is_uint(v) ? "__umulhi" : "__mulhi", 2);
+            if (type_size[v->type] == 8)
+                render_call(v, jitc_is_uint(v) ? "__umul64hi" : "__mul64hi", 2);
+            else
+                render_call(v, jitc_is_uint(v) ? "__umulhi" : "__mulhi", 2);
             break;
 
         case VarKind::MulWide:
@@ -248,16 +357,22 @@ static void jitc_hip_render(Variable *v) {
 
         case VarKind::Bitcast: {
             Variable *a = jitc_var(v->dep[0]);
-            bool wide = is_f64(v) || is_f64(a);
+
             // Reinterpret through the device intrinsics rather than a pointer
             // cast or __builtin_bit_cast -- the latter is Clang-only and NVRTC
             // rejects it (BACKEND_NOTES §11a).
-            const char *fn;
-            if (jitc_is_float(v))
-                fn = wide ? "__longlong_as_double" : "__uint_as_float";
+            //
+            // Only ONE side can be floating point: the two types have the same
+            // width but differ, so f32/f64 never face each other. When NEITHER
+            // is, there is nothing to reinterpret -- a plain cast between two
+            // same-width integers already yields the bit pattern. Reaching for
+            // a float intrinsic there converts the value first, turning
+            // Int64(6) into 0x40c00000 (spec_cast.hip bit 14).
+            const char *fn = jitc_is_float(a) ? to_bits_fn(a) : from_bits_fn(v);
+            if (fn)
+                fmt("$t $v = ($t) $s($v);\n", v, v, v, fn, a);
             else
-                fn = wide ? "__double_as_longlong" : "__float_as_uint";
-            render_call(v, fn, 1);
+                fmt("$t $v = ($t) $v;\n", v, v, v, a);
             break;
         }
 

@@ -66,6 +66,14 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     float r11 = r1 * r2 + r2;
     if (!(r10 - r11 < 1e-3f && r11 - r10 < 1e-3f)) err |= 1u << 7;
 
+    // Fma on an INTEGER is plain `a * b + c`. There is no __mad on either
+    // platform (only __mul24 / __umul24, which truncate to 24 bits), and
+    // integer arithmetic is exact modulo the width, so there is nothing to
+    // fuse -- the multiply cannot lose precision for the add to recover.
+    uint32_t r10i = 7u, r11i = 11u, r12i = 5u;
+    uint32_t r13i = r10i * r11i + r12i;
+    if (r13i != 82u) err |= 1u << 7;
+
     // --- Min / Max ----------------------------------------------------------
     float r12 = fminf(r1, r2);  // Min
     if (r12 != r1) err |= 1u << 8;

@@ -41,6 +41,7 @@
 #pragma once
 
 #include "var.h"
+#include "hip_preamble.h"   // hip_type_preamble (kept dependency-free on purpose)
 
 /// HIP type names. Short spellings, typedef'd in the kernel preamble.
 inline constexpr NameTable<(size_t) VarType::Count> type_name_hip({
@@ -85,20 +86,6 @@ inline constexpr NameTable<(size_t) VarType::Count> type_name_hip_bin({
     /* Float64 */ "u64"
 });
 
-/// Preamble emitted at the top of every generated kernel, mapping the short
-/// spellings above onto real types.
-///
-/// NVRTC ships no <stdint.h>, so the fixed-width types are declared here rather
-/// than included -- mirroring tools/hip_validate/prelude_nvrtc.h.
-inline constexpr const char *hip_type_preamble =
-    "typedef signed char        i8;\n"
-    "typedef unsigned char      u8;\n"
-    "typedef short              i16;\n"
-    "typedef unsigned short     u16;\n"
-    "typedef int                i32;\n"
-    "typedef unsigned int       u32;\n"
-    "typedef long long          i64;\n"
-    "typedef unsigned long long u64;\n"
-    "typedef float              f32;\n"
-    "typedef double             f64;\n"
-    "\n";
+// The preamble that maps these short spellings onto real types lives in
+// hip_preamble.h, which the include above pulls in. It is kept in a separate,
+// dependency-free header so the validation harness can compile it for gfx90a.

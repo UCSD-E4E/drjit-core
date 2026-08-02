@@ -1222,6 +1222,10 @@ void jit_eval() {
     if (tl.ts_metal)
         jitc_eval(tl.ts_metal);
 #endif
+#if defined(DRJIT_ENABLE_HIP)
+    if (tl.ts_hip)
+        jitc_eval(tl.ts_hip);
+#endif
 }
 
 int jit_var_eval(uint32_t index) {

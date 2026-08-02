@@ -36,6 +36,11 @@ using Int32M  = MetalArray<int32_t>;
 using UInt32M = MetalArray<uint32_t>;
 using MaskM   = MetalArray<bool>;
 using HalfM   = MetalArray<drjit::half>;
+using FloatH  = HIPArray<float>;
+using Int32H  = HIPArray<int32_t>;
+using UInt32H = HIPArray<uint32_t>;
+using MaskH   = HIPArray<bool>;
+using HalfH   = HIPArray<drjit::half>;
 
 #define TEST_REGISTER_CUDA(name, suffix, FloatType, ...)                       \
     int test##name##_##suffix =                                                \
@@ -63,6 +68,16 @@ using HalfM   = MetalArray<drjit::half>;
         test_register("test" #name#suffix,                                     \
                       test##name<JitBackend::Metal, FloatType, Int32M, UInt32M,\
                                  MaskM, MetalArray>,                           \
+                      ##__VA_ARGS__);
+
+// Registered unconditionally, exactly like Metal: when the HIP backend is
+// absent (a default build, or no device) `main()` skips every `_hip` test at
+// runtime. Nothing here needs DRJIT_ENABLE_HIP at compile time.
+#define TEST_REGISTER_HIP(name, suffix, FloatType, ...)                        \
+    int test##name##_##suffix =                                                \
+        test_register("test" #name#suffix,                                     \
+                      test##name<JitBackend::HIP, FloatType, Int32H, UInt32H,  \
+                                 MaskH, HIPArray>,                             \
                       ##__VA_ARGS__);
 
 #define TEST_CUDA(name, ...)                                                   \
@@ -98,10 +113,13 @@ using HalfM   = MetalArray<drjit::half>;
     TEST_REGISTER_LLVM(name,    _llvm_fp32,     FloatL)                        \
     TEST_REGISTER_LLVM(name,    _llvm_fp16,     HalfL)                         \
     TEST_REGISTER_METAL(name,   _metal_fp32,    FloatM)                        \
+    TEST_REGISTER_HIP(name,     _hip_fp32,      FloatH)                        \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()
 
+// "No Metal" means Metal specifically -- these tests use float64, which Metal
+// lacks and gfx90a has natively. HIP therefore belongs here.
 #define TEST_ALL_NO_METAL(name, ...)                                           \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
@@ -112,6 +130,7 @@ using HalfM   = MetalArray<drjit::half>;
     TEST_REGISTER_OPTIX(name,   _optix_fp16,    HalfC)                         \
     TEST_REGISTER_LLVM(name,    _llvm_fp32,     FloatL)                        \
     TEST_REGISTER_LLVM(name,    _llvm_fp16,     HalfL)                         \
+    TEST_REGISTER_HIP(name,     _hip_fp32,      FloatH)                        \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()
@@ -124,6 +143,7 @@ using HalfM   = MetalArray<drjit::half>;
     TEST_REGISTER_OPTIX(name,   _optix,    FloatC)                             \
     TEST_REGISTER_LLVM(name,    _llvm,     FloatL)                             \
     TEST_REGISTER_METAL(name,   _metal,    FloatM)                             \
+    TEST_REGISTER_HIP(name,     _hip,      FloatH)                             \
     template <JitBackend Backend, typename Float, typename Int32,              \
               typename UInt32, typename Mask, template <class> class Array>    \
     void test##name()

@@ -68,14 +68,18 @@ inline std::string jitc_hip_literal(VarType vt, uint64_t value) {
         // negative decimal would be equivalent for the value but not for the
         // bit pattern of the minimum of each type, where the negation of the
         // literal overflows before the cast applies.
+        //
+        // The cast names are the SHORT spellings from type_name_hip, not the
+        // stdint ones: the generated kernel preamble (hip_preamble.h) declares
+        // i8/i16/i32/i64 because neither runtime compiler can reach <stdint.h>.
         case VarType::Int8:
-            return "(int8_t) " + jitc_hip_hex(value & 0xffull, "u");
+            return "(i8) " + jitc_hip_hex(value & 0xffull, "u");
         case VarType::Int16:
-            return "(int16_t) " + jitc_hip_hex(value & 0xffffull, "u");
+            return "(i16) " + jitc_hip_hex(value & 0xffffull, "u");
         case VarType::Int32:
-            return "(int32_t) " + jitc_hip_hex(value & 0xffffffffull, "u");
+            return "(i32) " + jitc_hip_hex(value & 0xffffffffull, "u");
         case VarType::Int64:
-            return "(int64_t) " + jitc_hip_hex(value, "ull");
+            return "(i64) " + jitc_hip_hex(value, "ull");
 
         // --- Unsigned integers ------------------------------------------------
         case VarType::UInt8:

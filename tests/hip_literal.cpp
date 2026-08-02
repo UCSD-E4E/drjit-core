@@ -71,8 +71,13 @@ int main(int, char **) {
     expect(VarType::UInt32, 4294967295ull, "0xffffffffu", "UInt32 max, u suffix");
     expect(VarType::UInt64, 18446744073709551615ull, "0xffffffffffffffffull",
            "UInt64 max, ull suffix (no truncation)");
-    expect(VarType::Int32, (uint64_t) (int64_t) -1, "(int32_t) 0xffffffffu",
-           "Int32 -1 via unsigned pattern + cast");
+    // The cast must use the SHORT spelling from type_name_hip. The generated
+    // kernel preamble defines i8/i16/i32/i64 and nothing else -- <stdint.h> is
+    // out of reach for both runtime compilers -- so "(int32_t)" produced source
+    // that only compiled inside the hip_validate harness, whose prelude happens
+    // to declare the stdint names.
+    expect(VarType::Int32, (uint64_t) (int64_t) -1, "(i32) 0xffffffffu",
+           "Int32 -1 via unsigned pattern + cast, short spelling");
 
     // Pointers are integers here; the emitter casts per use site.
     expect(VarType::Pointer, 0x7f0011223344ull, "0x7f0011223344ull",

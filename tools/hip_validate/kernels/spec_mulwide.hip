@@ -69,5 +69,18 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     if (r13 != (uint32_t) (r12 >> 32)) err |= 1u << 7;
     if (r13 != 1u) err |= 1u << 8;   // (0x10000+i) * 0x10000 >> 32 == 1
 
+    // --- 64-bit MulHi --------------------------------------------------------
+    //
+    // A separate intrinsic, not a wider overload: __umulhi applied to 64-bit
+    // operands would silently narrow them to 32 bits, which for the pattern
+    // below gives 0xfffffffe instead of 0xfffffffffffffffe.
+    uint64_t r14 = 0xffffffffffffffffull;
+    uint64_t r15 = __umul64hi(r14, r14);
+    if (r15 != 0xfffffffffffffffeull) err |= 1u << 9;
+
+    int64_t r16 = -1, r17 = __mul64hi(r16, r16);
+    if (r17 != 0) err |= 1u << 10;
+    if ((uint64_t) r17 == r15) err |= 1u << 11;   // must differ from unsigned
+
     out[r0] = (float) err;
 }
