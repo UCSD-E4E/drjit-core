@@ -182,6 +182,44 @@ multi-target ones are reached through the function table and never named.
 HIP C++ has the same declare-before-use requirement, so this machinery ports
 directly.
 
+### 9a. Dispatch shape — HIP uses a `switch`, not a function table
+
+The one place with no usable template. `callable_index` is assigned **globally
+across the kernel** (`cuda_eval.cpp:235`, `metal_eval.cpp:375`), and both of
+those backends build a single table of that size and reinterpret it with each
+call site's signature — PTX because `.u64 callables[]` is untyped, Metal
+because `visible_function_table` is reinterpretable.
+
+HIP C++ has neither escape hatch. `spec_call.hip` tested all three candidates
+on both arms:
+
+| shape | gfx90a | NVRTC (shim) |
+|---|---|---|
+| A. `switch` over the global index, direct calls | ✅ | ✅ |
+| B. typed `__device__` fn-pointer table, no casts | ✅ | ✅ |
+| C. one table cast to a common fn-pointer type | ✅ | ❌ |
+
+C is what would have let HIP inherit the existing scheme unchanged, and it is
+the one that fails:
+
+```
+error: dynamic initialization is not supported for a __device__ variable
+```
+
+A bare function name is a constant address; a *cast* of one is not, as far as
+NVRTC is concerned. B compiles because it has no casts — but B only works when
+every entry shares a signature, which across a whole kernel they do not.
+
+Since the shim is the only place the vcall path can be executed before the
+MI210 arrives, a shape that cannot run there is not testable. **So the emitter
+uses A.** It needs no table, no cast, and no indirect-call ABI on AMDGPU at
+all; every arm is a direct call the compiler may inline. The cost is code size
+proportional to the instances reachable from each call site — worth measuring
+on a real Mitsuba scene (§5 Phase 2 "codegen tuning"), not worth pre-empting.
+
+Note the indices are **sparse** at any one site, because the index space is
+kernel-wide. A `switch` handles that; an array would need holes.
+
 ---
 
 ## 10. Formatting pass — copy wholesale
