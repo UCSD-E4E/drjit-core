@@ -96,6 +96,7 @@ bool jitc_hip_api_init() {
         LOAD(hipEventCreateWithFlags);
         LOAD(hipEventDestroy);
         LOAD(hipEventRecord);
+        LOAD(hipEventSynchronize);
 
         LOAD(hipMalloc);
         LOAD(hipFree);
@@ -150,6 +151,7 @@ void jitc_hip_api_shutdown() {
     Z(hipStreamCreateWithFlags); Z(hipStreamDestroy);
     Z(hipStreamSynchronize); Z(hipStreamWaitEvent);
     Z(hipEventCreateWithFlags); Z(hipEventDestroy); Z(hipEventRecord);
+    Z(hipEventSynchronize);
     Z(hipMalloc); Z(hipFree); Z(hipMallocAsync); Z(hipFreeAsync);
     Z(hipHostMalloc); Z(hipHostFree); Z(hipMemGetInfo);
     Z(hipMemcpyAsync); Z(hipMemsetD8Async); Z(hipMemsetD16Async);

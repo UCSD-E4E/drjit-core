@@ -181,7 +181,21 @@ if (DRJIT_ENABLE_METAL)
 endif()
 
 if (DRJIT_ENABLE_HIP)
+  # Precompiled gfx90a device library (PLAN.md Phase 3). Only the real runtime
+  # path needs it: under the CUDA shim HIPThreadState *is* CUDAThreadState and
+  # launches the PTX blob embedded above.
+  if (NOT DRJIT_HIP_CUDA_SHIM)
+    drjit_embed_binary(
+      OUTPUT  ${CMAKE_CURRENT_BINARY_DIR}/resources/kernels_gfx90a.c
+      SYMBOLS kernels_gfx90a
+      INPUTS  ${CMAKE_CURRENT_SOURCE_DIR}/resources/kernels_gfx90a.lz4
+      TYPE    char
+      HEADER  resources/kernels_hip.h)
+    set(DRJIT_HIP_KERNELS ${CMAKE_CURRENT_BINARY_DIR}/resources/kernels_gfx90a.c)
+  endif()
+
   set(DRJIT_HIP_FILES
+    ${DRJIT_HIP_KERNELS}
     src/hip.h
     src/hip_api.h
     src/hip_api.cpp

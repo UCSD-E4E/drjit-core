@@ -795,11 +795,66 @@ struct HIPDevice {
     /// hardcoded width silently miscomputes on a warp-32 test platform.
     uint32_t warp_size;
 
+    /// Number of compute units
+    uint32_t sm_count;
+
+    /// Size of the LDS (shared memory) available to one workgroup, in bytes
+    uint32_t shared_memory_bytes;
+
     /// Total device memory in bytes
     size_t memory_total;
 
     /// Cached human-readable device name (owned, freed at shutdown)
     char *name;
+
+    /// hipModule_t of the precompiled device library, loaded on first use
+    void *kernel_module;
+
+    /// Launch configuration for a flat, one-thread-per-element kernel.
+    ///
+    /// The CUDA twin of this (CUDADevice::get_launch_config) opens with
+    /// `warp_size = 32`; here the width comes from the device, per §3.3. That
+    /// is not cosmetic: `thread_count` is rounded to whole wavefronts because
+    /// the mkperm kernels ballot across a full wavefront, and rounding to 32 on
+    /// a wave64 part would leave half of each ballot reading uninitialized
+    /// lanes.
+    void get_launch_config(uint32_t *blocks_out, uint32_t *threads_out,
+                           uint32_t size, uint32_t max_threads = 1024,
+                           uint32_t max_blocks_per_sm = 0) const {
+        uint32_t warp_count          = (size + warp_size - 1) / warp_size,
+                 max_warps_per_block = (max_threads + warp_size - 1) / warp_size;
+
+        uint32_t block_count, warps_per_block;
+        if (warp_count <= sm_count) {
+            block_count = warp_count;
+            warps_per_block = 1;
+        } else {
+            block_count = sm_count;
+            warps_per_block = (warp_count + block_count - 1) / block_count;
+
+            if (warps_per_block > max_warps_per_block) {
+                block_count = (warp_count + max_warps_per_block - 1) / max_warps_per_block;
+
+                if (block_count < sm_count * 4)
+                    block_count = (block_count + sm_count - 1) / sm_count * sm_count;
+
+                uint32_t max_blocks = max_blocks_per_sm * sm_count;
+                if (max_blocks && block_count > max_blocks) {
+                    block_count = max_blocks;
+                    warps_per_block = max_warps_per_block;
+                } else {
+                    warps_per_block = (warp_count + block_count - 1) / block_count;
+                    block_count = (warp_count + warps_per_block - 1) / warps_per_block;
+                }
+            }
+        }
+
+        if (blocks_out)
+            *blocks_out = block_count;
+
+        if (threads_out)
+            *threads_out = warps_per_block * warp_size;
+    }
 };
 #endif
 

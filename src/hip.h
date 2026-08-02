@@ -27,6 +27,17 @@ extern bool jitc_hip_init();
 /// Release all resources held by the HIP backend.
 extern void jitc_hip_shutdown();
 
+#if !defined(DRJIT_HIP_CUDA_SHIM)
+/// Look up a kernel of the precompiled device library by name.
+///
+/// Returns a hipFunction_t (as void *), or nullptr if the library is
+/// unavailable on this device -- which happens when the device's wavefront
+/// width differs from the one the blob was built for, and is reported once by
+/// the loader. Callers must handle nullptr rather than assume; see the six
+/// utility-kernel methods in hip_ts.cpp.
+extern void *jitc_hip_kernel(int device, const char *name);
+#endif
+
 #if defined(DRJIT_HIP_CUDA_SHIM)
 /// Compile generated HIP C++ source into a loadable module.
 ///

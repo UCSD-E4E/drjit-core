@@ -45,6 +45,10 @@ tests/microbenchmark
 /resources/kernels.c
 /resources/metal_kernels.c
 /resources/pack
+/resources/pack_hip
+/resources/kernels_gfx90a.co
+/resources/kernels_gfx90a.elf
+/resources/kernels_gfx90a.c
 /resources/kernels_75.ptx
 /resources/metal_kernels.air
 build-hip/

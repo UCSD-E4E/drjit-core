@@ -23,6 +23,31 @@ pack: pack.c
 kernels_75.lz4: pack kernels_75.ptx
 	./pack
 
+# Precompiled AMD kernels shipped with Dr.Jit-core (PLAN.md Phase 3). Requires
+# ROCm, unlike the build itself, which only embeds the committed blob.
+#
+# Two steps rather than one: --genco emits a clang OFFLOAD BUNDLE, and we embed
+# the code object it contains. See pack_hip.c for why.
+HIP_ARCH ?= gfx90a
+HIPCC ?= hipcc
+BUNDLER ?= clang-offload-bundler
+
+hip: kernels_$(HIP_ARCH).lz4
+
+kernels_$(HIP_ARCH).co: common.h block_reduce.cuh block_prefix_reduce.cuh reduce_2.cuh compress.cuh mkperm.cuh misc.cuh kernels.cu
+	$(HIPCC) --offload-arch=$(HIP_ARCH) --genco -std=c++17 -O3 kernels.cu -o $@
+
+kernels_$(HIP_ARCH).elf: kernels_$(HIP_ARCH).co
+	$(BUNDLER) --unbundle --type=o \
+		--targets=hipv4-amdgcn-amd-amdhsa--$(HIP_ARCH) \
+		--input=$< --output=$@
+
+pack_hip: pack_hip.c
+	$(CC) pack_hip.c ../ext/lz4/lz4hc.c ../ext/lz4/lz4.c -o pack_hip -I ../ext/lz4
+
+kernels_$(HIP_ARCH).lz4: pack_hip kernels_$(HIP_ARCH).elf
+	./pack_hip $(HIP_ARCH)
+
 # Precompiled Metal kernels shipped with Dr.Jit-core (macOS only). Requires the
 # full Metal toolchain (xcrun metal), unlike the build itself, which only embeds
 # the committed metallib.
@@ -34,4 +59,5 @@ metal_kernels.metallib: metal_kernels.metal
 	rm -f metal_kernels.air
 
 clean:
-	rm -f kernels_75.ptx kernels.bin metal_kernels.air
+	rm -f kernels_75.ptx kernels.bin metal_kernels.air \
+	      kernels_$(HIP_ARCH).co kernels_$(HIP_ARCH).elf

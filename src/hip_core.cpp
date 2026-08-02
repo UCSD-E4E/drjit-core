@@ -33,6 +33,12 @@
 #include "log.h"
 #include "internal.h"
 #include "cuda.h"
+#include "malloc.h"
+#include "io.h"
+#if defined(DRJIT_ENABLE_HIP) && !defined(DRJIT_HIP_CUDA_SHIM)
+#  include "resources/kernels_hip.h"
+#  include <lz4.h>
+#endif
 #include <dlfcn.h>
 #include <vector>
 #include <string>
@@ -136,6 +142,18 @@ bool jitc_hip_init() {
             return jitc_hip_fail("hipDeviceGetAttribute(WarpSize)", rv);
         dev.warp_size = (uint32_t) warp_size;
 
+        int sm_count = 0, shared_memory_bytes = 0;
+        if ((rv = hipDeviceGetAttribute(&sm_count,
+                                        hipDeviceAttributeMultiprocessorCount,
+                                        dev_id)) != hipSuccess)
+            return jitc_hip_fail("hipDeviceGetAttribute(MultiprocessorCount)", rv);
+        if ((rv = hipDeviceGetAttribute(&shared_memory_bytes,
+                                        hipDeviceAttributeMaxSharedMemoryPerBlock,
+                                        dev_id)) != hipSuccess)
+            return jitc_hip_fail("hipDeviceGetAttribute(MaxSharedMemoryPerBlock)", rv);
+        dev.sm_count = (uint32_t) sm_count;
+        dev.shared_memory_bytes = (uint32_t) shared_memory_bytes;
+
         size_t mem_total = 0;
         if ((rv = hipDeviceTotalMem(&mem_total, dev_id)) != hipSuccess)
             return jitc_hip_fail("hipDeviceTotalMem", rv);
@@ -191,10 +209,101 @@ bool jitc_hip_init() {
     return !state.hip_devices.empty();
 }
 
+// ---------------------------------------------------------------------------
+//  Precompiled device library (PLAN.md Phase 3)
+// ---------------------------------------------------------------------------
+//
+// block_reduce, compress, mkperm and friends are not API calls; they launch
+// kernels from resources/kernels.cu. CUDA ships those as PTX and JITs each one
+// on first use, because compiling all ~650 of them to reach one costs seconds.
+// A gfx90a code object is already machine code, so there is nothing to defer:
+// the blob is decompressed once, loaded once per device, and functions are
+// resolved by name.
+//
+// The width the blob was BUILT for is checked against the width the device
+// REPORTS before anything is launched. resources/common.h fixes WarpSize at
+// compile time from the target (__GFX9__ => 64), so a device that disagrees --
+// an RDNA part, say -- would run wave64 cross-lane code at width 32 and return
+// quietly wrong reductions. §3.3 asks for that to be loud instead.
+
+static char *jitc_hip_kernels_alloc = nullptr;
+
+/// Wavefront width resources/kernels_gfx90a.lz4 was compiled for.
+#define DR_HIP_KERNELS_WARP_SIZE 64
+
+static bool jitc_hip_load_kernels(HIPDevice &dev) {
+    if (dev.kernel_module)
+        return true;
+
+    if (dev.warp_size != DR_HIP_KERNELS_WARP_SIZE) {
+        jitc_log(Warn,
+                 "jit_hip(): the precompiled device library targets wave%u, but "
+                 "device \"%s\" (%s) reports wave%u. Reductions, scans and "
+                 "permutations would silently return wrong results, so they "
+                 "are unavailable. Rebuild resources/ for this target "
+                 "(make -C resources hip HIP_ARCH=%s).",
+                 DR_HIP_KERNELS_WARP_SIZE, dev.name ? dev.name : "?", dev.arch,
+                 dev.warp_size, dev.arch);
+        return false;
+    }
+
+    if (!jitc_hip_kernels_alloc) {
+        jitc_lz4_init();
+
+        jitc_hip_kernels_alloc =
+            (char *) malloc_check(kernels_gfx90a_size_uncompressed);
+
+        int actual = LZ4_decompress_safe(
+            kernels_gfx90a, jitc_hip_kernels_alloc,
+            (int) kernels_gfx90a_size_compressed,
+            (int) kernels_gfx90a_size_uncompressed);
+
+        if ((size_t) actual != kernels_gfx90a_size_uncompressed)
+            jitc_fail("jit_hip(): decompression of the builtin kernels failed! "
+                      "Expected %zu bytes (a negative value indicates an "
+                      "error), got %d.",
+                      kernels_gfx90a_size_uncompressed, actual);
+    }
+
+    hipModule_t mod = nullptr;
+    hipError_t rv = hipModuleLoadData(&mod, jitc_hip_kernels_alloc);
+    if (rv != hipSuccess) {
+        const char *msg = hipGetErrorString ? hipGetErrorString(rv) : nullptr;
+        jitc_log(Warn,
+                 "jit_hip(): could not load the precompiled device library on "
+                 "device \"%s\" (%s): %d%s%s.", dev.name ? dev.name : "?",
+                 dev.arch, (int) rv, msg ? ": " : "", msg ? msg : "");
+        return false;
+    }
+
+    dev.kernel_module = (void *) mod;
+    return true;
+}
+
+void *jitc_hip_kernel(int device, const char *name) {
+    HIPDevice &dev = state.hip_devices[device];
+
+    if (!jitc_hip_load_kernels(dev))
+        return nullptr;
+
+    hipFunction_t func = nullptr;
+    hipError_t rv = hipModuleGetFunction(&func, (hipModule_t) dev.kernel_module,
+                                         name);
+    if (rv != hipSuccess)
+        return nullptr;   // caller reports; the name is the useful detail
+
+    return (void *) func;
+}
+
 void jitc_hip_shutdown() {
-    for (HIPDevice &d : state.hip_devices)
+    for (HIPDevice &d : state.hip_devices) {
+        if (d.kernel_module)
+            hipModuleUnload((hipModule_t) d.kernel_module);
         free(d.name);
+    }
     state.hip_devices.clear();
+    free(jitc_hip_kernels_alloc);
+    jitc_hip_kernels_alloc = nullptr;
     jitc_hip_api_shutdown();
 }
 

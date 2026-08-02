@@ -130,6 +130,7 @@ DR_HIP_SYM(hipError_t (*hipStreamWaitEvent)(hipStream_t, hipEvent_t, unsigned in
 DR_HIP_SYM(hipError_t (*hipEventCreateWithFlags)(hipEvent_t *, unsigned int));
 DR_HIP_SYM(hipError_t (*hipEventDestroy)(hipEvent_t));
 DR_HIP_SYM(hipError_t (*hipEventRecord)(hipEvent_t, hipStream_t));
+DR_HIP_SYM(hipError_t (*hipEventSynchronize)(hipEvent_t));
 
 DR_HIP_SYM(hipError_t (*hipMalloc)(void **, size_t));
 DR_HIP_SYM(hipError_t (*hipFree)(void *));
