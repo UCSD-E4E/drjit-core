@@ -606,6 +606,57 @@ generator (font names, `dpi`, backend-name capitalisation, and variable
 ordering). Do not chase it as a regression; it needs an upstream fix or a
 regenerated reference.
 
+## 11g. The device library — what the port actually changed
+
+Phase 3 needed `resources/*.cuh` (the CUDA-only half that `block_reduce`,
+`compress`, `mkperm` and friends live in) to compile for `gfx90a`. Ported in
+place rather than forked, so the two targets cannot drift. Findings worth
+carrying:
+
+- **ROCm 7.2 has `__ballot_sync` / `__shfl_*_sync` / `__any_sync` /
+  `__match_any_sync` / `__syncwarp`**, and `amd_warp_sync_functions.h`
+  `static_assert`s that the mask is 64-bit. That turns "you forgot a
+  `0xFFFFFFFF`" from a silent wrong answer into a compile error — the single
+  most useful safety property in this whole area. Do not defeat it by casting.
+- **`warpSize` is not a constant expression on HIP.** It cannot size a template
+  or a `constexpr`. There is also no wavefront-width macro in 7.2 —
+  `__AMDGCN_WAVEFRONT_SIZE__` is gone. `resources/common.h` derives the width
+  from `__GFX9__` (every GFX9 part is wave64-only) and the host refuses to load
+  the blob if the device disagrees.
+- **`.cg` has no AMD spelling.** The decoupled-lookback scans publish a
+  (value, status) word that successors spin on; a read served from the
+  CU-private, non-coherent L1 either spins forever or pairs a "done" status
+  with a stale value. The equivalent is `__hip_atomic_load/store` at
+  `__HIP_MEMORY_SCOPE_AGENT`. This is semantics, not syntax.
+- **`umax` / `ullmax` / `llmax` and friends do not exist on HIP.** Clang finds
+  the signed 32-bit forms through `<algorithm>`; the rest need shims.
+- **`gemm.cuh` uses `__grid_constant__`**, which has no HIP spelling. Excluded
+  on HIP — `batched_gemm` routes to rocBLAS, which nothing we target reaches.
+- **`--genco` emits an offload bundle** (`CCOB` once compressed), same as
+  HIP-RT's bitcode in §7a. The Makefile unbundles it; `pack_hip` embeds the raw
+  code object, which every HIP version accepts.
+
+Two idioms were replaced wholesale because they encode the width in a literal
+and compile happily at the wrong one: `31 - __clz(ballot)` became
+`highest_lane_()`, and `peers << (32 - lane)` became
+`popc_(peers & lanemask_lt_(lane))` — the latter was also UB at lane 0.
+
+### Proving the port did not break anything
+
+Two independent checks, because neither alone is enough:
+
+1. **nvcc PTX, entry by entry.** 638 of 646 entries are byte-identical to the
+   pre-port build; the 8 that differ are exactly the intended ones (7 mkperm
+   plus `compress_large`). This bounds the blast radius without running a thing.
+2. **`devlib_check.sh`.** The suite cannot otherwise see the port at all —
+   drjit-core embeds the *committed* `kernels_75.lz4`, which predates it. The
+   script regenerates that blob from the ported sources, rebuilds, and runs
+   drjit-core's own tests against it: 8/8. That is real execution of the eight
+   changed kernels on real hardware.
+
+Both run at width 32. Neither says anything about wave64, which is the point of
+carrying the width as a parameter rather than fixing it.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
