@@ -65,6 +65,30 @@ if (DRJIT_ENABLE_HIP)
   add_test(NAME hip_types COMMAND hip_types
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
+  # Does src/hip_api.h agree with a real ROCm install? Needs no AMD GPU --
+  # libamdhip64.so loads and exports its symbols anywhere.
+  add_executable(hip_api_abi hip_api_abi.cpp hip_api_abi_rocm.cpp)
+  set_property(TARGET hip_api_abi PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_api_abi PRIVATE drjit-core ${CMAKE_DL_LIBS})
+  # DRJIT_ENABLE_HIP / DRJIT_DYNAMIC_HIP are PRIVATE to the library target, so
+  # the test must opt in explicitly or hip_api.h compiles away to nothing and
+  # the test silently reports "backend disabled".
+  target_compile_definitions(hip_api_abi PRIVATE -DDRJIT_ENABLE_HIP=1)
+  if (DRJIT_DYNAMIC_HIP)
+    target_compile_definitions(hip_api_abi PRIVATE -DDRJIT_DYNAMIC_HIP=1)
+  endif()
+  if (DEFINED ENV{ROCM_INCLUDE_PATH} AND
+      EXISTS "$ENV{ROCM_INCLUDE_PATH}/hip/hip_runtime_api.h")
+    target_include_directories(hip_api_abi PRIVATE "$ENV{ROCM_INCLUDE_PATH}")
+    target_compile_definitions(hip_api_abi PRIVATE
+      -DDRJIT_HIP_HAVE_HEADERS=1 -D__HIP_PLATFORM_AMD__=1)
+    message(STATUS "Dr.Jit-Core: HIP ABI test will cross-check constants "
+                   "against $ENV{ROCM_INCLUDE_PATH}")
+  endif()
+  add_test(NAME hip_api_abi COMMAND hip_api_abi
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  set_tests_properties(hip_api_abi PROPERTIES SKIP_RETURN_CODE 77)
+
   # Packed backend fields. Pure lookup/arithmetic, no device needed.
   add_executable(hip_packing hip_packing.cpp)
   set_property(TARGET hip_packing PROPERTY CXX_STANDARD 17)

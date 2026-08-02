@@ -183,6 +183,8 @@ endif()
 if (DRJIT_ENABLE_HIP)
   set(DRJIT_HIP_FILES
     src/hip.h
+    src/hip_api.h
+    src/hip_api.cpp
     src/hip_ts.h
     src/hip_core.cpp
     src/hip_prologue.h
