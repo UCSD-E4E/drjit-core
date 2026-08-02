@@ -507,10 +507,14 @@ Two are worth carrying forward as patterns rather than incidents:
 | `test_reductions` | 14/14 |
 | `test_vcall` | 14/14 |
 | `test_record` | 9/9 |
-| `test_array` | skipped — `VarKind::Array` |
+| `test_array` | 15/15 |
 
-The one remaining skip is listed in `tests/test.cpp` and PRINTS its reason on
-every run. Delete the entry when the subsystem lands.
+**Every suite in the tree now runs against HIP.** The skip mechanism in
+`tests/test.cpp` is retained with an empty table: the next subsystem ported
+will want it, and an empty table states the position more clearly than a
+deleted one.
+
+`test_graphviz` is excluded, for the reason below.
 
 ### `test_graphviz` fails, and it is not ours
 

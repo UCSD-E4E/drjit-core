@@ -355,7 +355,7 @@ int main(int argc, char **argv) {
         test_hip &= (bool) jit_has_backend(JitBackend::HIP);
 
         // Suites resting on backend subsystems the HIP port has not reached
-        // yet (PLAN.md §5). They are skipped rather than left to abort: a
+        // yet (PLAN.md §5) are skipped from here rather than left to abort: a
         // jitc_fail() takes down the whole binary at the first one, which
         // hides every later test including the ones that do pass.
         //
@@ -364,12 +364,16 @@ int main(int argc, char **argv) {
         // tools/hip_validate/run_tests.sh prints its "unverified on NVIDIA"
         // list instead of describing it in prose. Delete an entry when the
         // subsystem lands; the suite will then either pass or say what broke.
+        //
+        // Currently EMPTY: every suite runs against HIP. Keep the mechanism --
+        // the next subsystem to be ported will want it, and an empty table is
+        // a clearer statement than a deleted one.
         if (test_hip) {
             static const struct { const char *suite, *reason; } hip_todo[] = {
-                { "array",  "VarKind::Array (local arrays)" }
+                { nullptr, nullptr }
             };
             for (const auto &e : hip_todo) {
-                if (strcmp(TEST_NAME, e.suite) == 0) {
+                if (e.suite && strcmp(TEST_NAME, e.suite) == 0) {
                     fprintf(stdout,
                             "Skipping HIP in this suite: %s is not implemented "
                             "for the HIP backend yet.\n", e.reason);

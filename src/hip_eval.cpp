@@ -35,6 +35,7 @@
 #include "hip_format.h"
 #include "hip_literal.h"
 #include "hip_prologue.h"
+#include "hip_array.h"
 
 // MUST BE LAST. This redefines `fmt` and `put` as macros, which would otherwise
 // mangle StringBuffer's own put() member declarations in strbuf.h. metal_eval.cpp
@@ -860,6 +861,40 @@ static void jitc_hip_render(Variable *v) {
             fmt("u32 $v = self;\n", v);
             break;
 
+        // --- Per-lane variable arrays -------------------------------------------
+        case VarKind::Array:
+            jitc_hip_render_array(v, v->dep[0] ? jitc_var(v->dep[0]) : nullptr);
+            break;
+
+        case VarKind::ArrayInit:
+            jitc_hip_render_array_init(v, jitc_var(v->dep[0]),
+                                       jitc_var(v->dep[1]));
+            break;
+
+        case VarKind::ArrayWrite:
+            jitc_hip_render_array_write(v, jitc_var(v->dep[0]),
+                                        jitc_var(v->dep[1]),
+                                        jitc_var(v->dep[2]),
+                                        v->dep[3] ? jitc_var(v->dep[3]) : nullptr);
+            break;
+
+        case VarKind::ArrayRead:
+            jitc_hip_render_array_read(v, jitc_var(v->dep[0]),
+                                       jitc_var(v->dep[1]),
+                                       v->dep[2] ? jitc_var(v->dep[2]) : nullptr);
+            break;
+
+        // No code: the phi aliases its predecessor's storage.
+        case VarKind::ArrayPhi:
+            v->reg_index = jitc_var(v->dep[0])->reg_index;
+            break;
+
+        case VarKind::ArraySelect:
+            jitc_hip_render_array_select(v, jitc_var(v->dep[0]),
+                                         jitc_var(v->dep[1]),
+                                         jitc_var(v->dep[2]));
+            break;
+
         default:
             jitc_fail("jitc_hip_render(): unhandled variable kind \"%s\"! The "
                       "source this opcode must produce is specified in "
@@ -1280,17 +1315,31 @@ void jitc_hip_assemble(ThreadState *ts, ScheduledGroup group,
                 continue;
             }
 
-            if (v->size > 1)
-                fmt("$t $v = ((const $t *) params.args[$o])[r0];\n", v, v, v, v);
-            else
-                fmt("$t $v = *(const $t *) params.args[$o];\n", v, v, v, v);
+            if (!v->is_array()) {
+                if (v->size > 1)
+                    fmt("$t $v = ((const $t *) params.args[$o])[r0];\n",
+                        v, v, v, v);
+                else
+                    fmt("$t $v = *(const $t *) params.args[$o];\n", v, v, v, v);
+            } else {
+                // The memcpy helpers reference this named `p<reg>` pointer.
+                fmt("const $t *p$v = (const $t *) params.args[$o];\n",
+                    v, v, v, v);
+                jitc_hip_render_array_memcpy_in(v);
+            }
             continue;
         }
 
         jitc_hip_render(v);
 
-        if (ptype == ParamType::Output)
-            fmt("(($t *) params.args[$o])[r0] = $v;\n", v, v, v);
+        if (ptype == ParamType::Output) {
+            if (!v->is_array()) {
+                fmt("(($t *) params.args[$o])[r0] = $v;\n", v, v, v);
+            } else {
+                fmt("$t *p$v = ($t *) params.args[$o];\n", v, v, v, v);
+                jitc_hip_render_array_memcpy_out(v);
+            }
+        }
     }
 
     put("}\n");
