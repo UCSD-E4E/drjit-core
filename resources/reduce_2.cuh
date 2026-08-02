@@ -35,30 +35,33 @@ __device__ void reduce_2(const Value *in_1, const Value *in_2, uint32_t size,
     shared[tid] = value;
     __syncthreads();
 
-    // Block-level reduction from nb*BlockSize -> nb*32 values
-    if (BlockSize >= 1024 && tid < 512)
+    // Block-level reduction from nb*BlockSize -> nb*WarpSize values. Each step
+    // is guarded by `WarpSize < S` as well: once the survivors fit in a single
+    // wavefront the shuffles below take over, so at width 64 the last step
+    // drops out rather than double-counting what the wavefront pass will redo.
+    if (BlockSize >= 1024 && WarpSize < 512 && tid < 512)
         shared[tid] = value = red(value, shared[tid + 512]);
     __syncthreads();
 
-    if (BlockSize >= 512 && tid < 256)
+    if (BlockSize >= 512 && WarpSize < 256 && tid < 256)
         shared[tid] = value = red(value, shared[tid + 256]);
     __syncthreads();
 
-    if (BlockSize >= 256 && tid < 128)
+    if (BlockSize >= 256 && WarpSize < 128 && tid < 128)
         shared[tid] = value = red(value, shared[tid + 128]);
     __syncthreads();
 
-    if (BlockSize >= 128 && tid < 64)
+    if (BlockSize >= 128 && WarpSize < 64 && tid < 64)
         shared[tid] = value = red(value, shared[tid + 64]);
     __syncthreads();
 
-    if (tid < 32) {
-        if (BlockSize >= 64)
-            value = red(value, shared[tid + 32]);
+    if (tid < WarpSize) {
+        if (BlockSize >= WarpSize * 2)
+            value = red(value, shared[tid + WarpSize]);
 
-        // Block-level reduction from nb*32 -> nb values
-        for (uint32_t i = 1; i < 32; i *= 2)
-            value = red(value, __shfl_xor_sync(WarpMask, value, i));
+        // Block-level reduction from nb*WarpSize -> nb values
+        for (uint32_t i = 1; i < WarpSize; i *= 2)
+            value = red(value, shfl_xor_(WarpMask, value, i));
 
         if (tid == 0)
             out[bid] = value;

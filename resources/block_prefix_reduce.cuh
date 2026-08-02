@@ -147,7 +147,7 @@ __device__ void block_prefix_reduce(block_prefix_reduce_params params) {
         scratch += chunk * 2;
 
         // The leader holds the chunk's reduced value
-        bool is_leader = tid == 1023;
+        bool is_leader = tid == BlockDim - 1;
 
         if (is_leader)
             store_with_status(scratch, memcpy_cast<UInt>(value), 1);
@@ -171,17 +171,17 @@ __device__ void block_prefix_reduce(block_prefix_reduce_params params) {
             }
 
             // Retry if at least one of the predecessors hasn't made any progress yet
-            if (__any_sync(WarpMask, status == 0))
+            if (any_(WarpMask, status == 0))
                 continue;
 
-            uint32_t mask = __ballot_sync(WarpMask, status == 2);
+            WarpMaskT mask = ballot_(WarpMask, status == 2);
             if (mask == 0) {
                 // Sum partial results, look back further
                 prefix = red(prefix, pred);
                 shift -= WarpSize;
             } else {
                 // Lane 'index' is done!
-                uint32_t index = 31 - __clz(mask);
+                uint32_t index = highest_lane_(mask);
 
                 // Sum up all the unconverged (higher) lanes *and* 'index'
                 if (lane >= index)
@@ -193,7 +193,7 @@ __device__ void block_prefix_reduce(block_prefix_reduce_params params) {
 
         // Warp-level sum reduction of 'prefix'
         for (uint32_t i = 1; i < WarpSize; i *= 2)
-            prefix = red(prefix, __shfl_xor_sync(WarpMask, prefix, i));
+            prefix = red(prefix, shfl_xor_(WarpMask, prefix, i));
 
         value = red(value, prefix);
 

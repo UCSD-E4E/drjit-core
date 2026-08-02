@@ -186,7 +186,7 @@ __device__ void block_reduce(block_reduce_params params) {
     // This first warp reduction brings the chunk size down to 'ReducedChunkSize'
     constexpr uint32_t ReducedChunkSize = ChunkSize / Active;
     for (uint32_t k = 1; k < Active; k *= 2)
-        value = red(value, __shfl_xor_sync(WarpMask, value, k, Active));
+        value = red(value, shfl_xor_(WarpMask, value, k, Active));
 
     // To reduce further, we need shared memory (happens when ChunkSize > 32)
     if constexpr (ReducedChunkSize > 1) {
@@ -204,7 +204,7 @@ __device__ void block_reduce(block_reduce_params params) {
         value = shared[tid];
 
         for (uint32_t k = 1; k < ReducedChunkSize; k *= 2)
-            value = red(value, __shfl_xor_sync(WarpMask, value, k, ReducedChunkSize));
+            value = red(value, shfl_xor_(WarpMask, value, k, ReducedChunkSize));
 
         // Different threads handle different chunks, and we moved their state around
         // Need to update the indices.

@@ -10,14 +10,24 @@
 
 #include "common.h"
 
+// See the DRJIT_STORE_CG / DRJIT_LOAD_CG commentary in common.h: these must
+// bypass the (non-coherent) L1, or the lookback loop below spins forever.
 DEVICE FINLINE void store_cg(volatile uint64_t *ptr, uint64_t val) {
+#if DRJIT_KERNELS_HIP
+    DRJIT_STORE_CG((uint64_t *) ptr, val);
+#else
     asm volatile("st.cg.u64 [%0], %1;" : : "l"(ptr), "l"(val));
+#endif
 }
 
 DEVICE FINLINE uint64_t load_cg(volatile uint64_t *ptr) {
+#if DRJIT_KERNELS_HIP
+    return DRJIT_LOAD_CG((const uint64_t *) ptr);
+#else
     uint64_t retval;
     asm volatile("ld.volatile.global.u64 %0, [%1];" : "=l"(retval) : "l"(ptr) : "memory");
     return retval;
+#endif
 }
 
 KERNEL void compress_small(const uint8_t *in, uint32_t *out, uint32_t size, uint32_t *count_out) {
@@ -99,9 +109,9 @@ KERNEL void compress_large(const uint8_t *in, uint32_t *out, volatile uint64_t *
     if (threadIdx.x == thread_count - 1)
         store_cg(scratch, (((uint64_t) sum_block) << 32) | 1ull);
 
-    uint32_t lane = threadIdx.x & (warpSize - 1);
+    uint32_t lane = threadIdx.x & (WarpSize - 1);
     uint32_t prefix = 0;
-    int32_t shift = lane - warpSize;
+    int32_t shift = (int32_t) lane - WarpSize;
 
     /* Compute prefix due to previous blocks using warp-level primitives.
        Based on "Single-pass Parallel Prefix Scan with Decoupled Look-back"
@@ -110,16 +120,16 @@ KERNEL void compress_large(const uint8_t *in, uint32_t *out, volatile uint64_t *
         uint64_t temp = load_cg(scratch + shift);
         uint32_t flag = (uint32_t) temp;
 
-        if (__any_sync(0xFFFFFFFF, flag == 0))
+        if (any_(WarpMask, flag == 0))
             continue;
 
-        uint32_t mask  = __ballot_sync(0xFFFFFFFF, flag == 2),
-                 value = (uint32_t) (temp >> 32);
+        WarpMaskT mask = ballot_(WarpMask, flag == 2);
+        uint32_t  value = (uint32_t) (temp >> 32);
         if (mask == 0) {
             prefix += value;
-            shift -= warpSize;
+            shift -= WarpSize;
         } else {
-            uint32_t index = 31 - __clz(mask);
+            uint32_t index = highest_lane_(mask);
             if (lane >= index)
                 prefix += value;
             break;
@@ -127,9 +137,9 @@ KERNEL void compress_large(const uint8_t *in, uint32_t *out, volatile uint64_t *
     }
 
     // Warp-level reduction
-    for (int offset = 16; offset > 0; offset /= 2)
-        prefix += __shfl_down_sync(0xFFFFFFFF, prefix, offset, 32);
-    sum_block += __shfl_sync(0xFFFFFFFF, prefix, 0);
+    for (uint32_t offset = WarpSize / 2; offset > 0; offset /= 2)
+        prefix += shfl_down_(WarpMask, prefix, offset, WarpSize);
+    sum_block += shfl_(WarpMask, prefix, 0);
 
     // Store block-level complete inclusive scan value in global memory
     if (threadIdx.x == thread_count - 1) {
@@ -150,7 +160,11 @@ KERNEL void compress_large(const uint8_t *in, uint32_t *out, volatile uint64_t *
 }
 
 KERNEL void compress_large_init(uint64_t *scratch, uint32_t size) {
+    // The first WarpSize slots are sentinels marked "complete, contributes 0":
+    // the lookback above starts at `lane - WarpSize` and would otherwise read
+    // before the buffer for the leading blocks. The host allocates the padding
+    // (see HIPThreadState::compress), so this bound must track the width.
     for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < size;
          i += blockDim.x * gridDim.x)
-        scratch[i] = (i < 32) ? 2 : 0;
+        scratch[i] = (i < WarpSize) ? 2 : 0;
 }
