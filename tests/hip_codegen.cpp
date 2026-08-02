@@ -166,6 +166,24 @@ int main(int, char **) {
         jit_var_dec_ref(rev); jit_var_dec_ref(g);   jit_var_dec_ref(g_eval);
     }
 
+    // ---- Control flow: NOT YET VERIFIED --------------------------------------
+    //
+    // jitc_hip_render() implements LoopStart/Cond/End/Phi/Output and
+    // CondStart/Mid/End, ported closely from metal_eval.cpp, and it compiles.
+    // It is NOT exercised here.
+    //
+    // A hand-rolled symbolic loop was attempted and removed: jit_var_loop_end()
+    // requires a jit_record_begin() checkpoint and may return 0, meaning the
+    // body must be recorded a second time after Dr.Jit simplifies the state.
+    // Getting that protocol subtly wrong produces a test that fails for reasons
+    // unrelated to codegen -- which is worse than no test, because it points at
+    // the wrong suspect.
+    //
+    // The right coverage is to register HIP with the TEST_* macros in
+    // tests/test.h so the existing test_loop / test_vcall suites run against
+    // this backend, rather than reimplementing their protocol by hand. Until
+    // then, treat control flow as WRITTEN BUT UNVERIFIED.
+
     jit_shutdown(0);
 
     if (failures) {

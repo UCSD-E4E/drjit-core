@@ -26,6 +26,8 @@
 #include "log.h"
 #include "strbuf.h"
 #include "call.h"        // jitc_call_upload
+#include "loop.h"        // LoopData
+#include "cond.h"        // CondData, jitc_cond_output_active
 #include <cstring>
 #include "hip.h"
 #include "hip_eval.h"
@@ -309,6 +311,146 @@ static void jitc_hip_render(Variable *v) {
                     mask, value, ptr, index, value);
             break;
         }
+
+        // --- Control flow -------------------------------------------------------
+        //
+        // Ports essentially verbatim from metal_eval.cpp: both backends emit
+        // C-family source, so `while (true) { ... }` and `if/else` are the same
+        // construct. What does NOT port by inspection is the SSA bookkeeping
+        // below, which is why it is followed closely rather than reconstructed.
+        case VarKind::LoopStart: {
+            const LoopData *ld = (LoopData *) v->data;
+            // Seed each loop-carried variable from its value outside the loop.
+            for (size_t i = 0; i < ld->size; ++i) {
+                Variable *inner_in = jitc_var(ld->inner_in[i]),
+                         *outer_in = jitc_var(ld->outer_in[i]);
+                if (inner_in == outer_in || !inner_in->reg_index ||
+                    inner_in->is_array())
+                    continue;
+                if (outer_in->reg_index)
+                    fmt("$t $v = $v;\n", inner_in, inner_in, outer_in);
+                else
+                    fmt("$t $v = ($t) 0;\n", inner_in, inner_in, inner_in);
+            }
+            put("while (true) {\n");
+            break;
+        }
+
+        case VarKind::LoopCond:
+            fmt("if (!$v) break;\n", jitc_var(v->dep[1]));
+            break;
+
+        case VarKind::LoopEnd: {
+            const LoopData *ld = (LoopData *) jitc_var(v->dep[0])->data;
+            uint32_t size = (uint32_t) ld->size;
+
+            // THE BACK EDGE. Copying inner_out -> inner_in naively is wrong when
+            // the sets alias: an earlier copy can clobber a value a later one
+            // still needs (a swap being the minimal example). So stage every
+            // aliasing output into a temporary first, then assign.
+            //
+            // `scratch` is borrowed as a marker and MUST be cleared afterwards,
+            // or it corrupts jitc_var_traverse()'s visited tracking in
+            // jit_eval() -- a failure that would appear far from here.
+            for (uint32_t i = 0; i < size; ++i) {
+                jitc_var(ld->inner_in[i])->scratch = 0;
+                jitc_var(ld->inner_out[i])->scratch = 0;
+            }
+
+            auto carried = [&](uint32_t i, Variable *&in, Variable *&out) {
+                in  = jitc_var(ld->inner_in[i]);
+                out = jitc_var(ld->inner_out[i]);
+                return !(in == out || !in->reg_index || !out->reg_index ||
+                         in->is_array());
+            };
+
+            Variable *in, *out;
+            for (uint32_t i = 0; i < size; ++i)
+                if (carried(i, in, out))
+                    in->scratch = 1;
+
+            for (uint32_t i = 0; i < size; ++i)
+                if (carried(i, in, out) && out->scratch == 1) {
+                    fmt("$t $v_tmp = $v;\n", out, out, out);
+                    out->scratch = 2;
+                }
+
+            for (uint32_t i = 0; i < size; ++i)
+                if (carried(i, in, out)) {
+                    if (out->scratch == 2)
+                        fmt("$v = $v_tmp;\n", in, out);
+                    else
+                        fmt("$v = $v;\n", in, out);
+                }
+
+            for (uint32_t i = 0; i < size; ++i) {
+                jitc_var(ld->inner_in[i])->scratch = 0;
+                jitc_var(ld->inner_out[i])->scratch = 0;
+            }
+
+            put("}\n");
+            break;
+        }
+
+        case VarKind::LoopPhi:
+            // Arrays alias their backing storage; scalars need no declaration
+            // here because LoopStart already emitted one.
+            if (v->is_array())
+                v->reg_index = jitc_var(v->dep[3])->reg_index;
+            break;
+
+        case VarKind::LoopOutput: {
+            const LoopData *ld = (LoopData *) jitc_var(v->dep[0])->data;
+            for (size_t i = 0; i < ld->size; ++i) {
+                if (jitc_var(ld->outer_out[i]) != v)
+                    continue;
+                Variable *inner_in = jitc_var(ld->inner_in[i]);
+                if (v->reg_index && inner_in->reg_index)
+                    fmt("$t $v = $v;\n", v, v, inner_in);
+                break;
+            }
+            break;
+        }
+
+        case VarKind::CondStart: {
+            const CondData *cd = (CondData *) v->data;
+            // Outputs are declared BEFORE the if, so both arms assign to the
+            // same variable and it stays live afterwards.
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vo = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo))
+                    fmt("$t $v;\n", vo, vo);
+            }
+            fmt("if ($v) {\n", jitc_var(v->dep[0]));
+            break;
+        }
+
+        case VarKind::CondMid: {
+            const CondData *cd = (CondData *) jitc_var(v->dep[0])->data;
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vt = jitc_var(cd->indices_t[i]),
+                         *vo = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo) && vt->reg_index)
+                    fmt("$v = $v;\n", vo, vt);
+            }
+            put("} else {\n");
+            break;
+        }
+
+        case VarKind::CondEnd: {
+            const CondData *cd = (CondData *) jitc_var(v->dep[0])->data;
+            for (size_t i = 0; i < cd->indices_out.size(); ++i) {
+                Variable *vf = jitc_var(cd->indices_f[i]),
+                         *vo = jitc_var(cd->indices_out[i]);
+                if (jitc_cond_output_active(vo) && vf->reg_index)
+                    fmt("$v = $v;\n", vo, vf);
+            }
+            put("}\n");
+            break;
+        }
+
+        case VarKind::CondOutput:
+            break;
 
         default:
             jitc_fail("jitc_hip_render(): unhandled variable kind \"%s\"! The "

@@ -368,6 +368,30 @@ roughly 150 lines, so it belongs in the §9 patch inventory rather than in a
 that could NOT be kept out of upstream files. Everything else has stayed in new
 `hip_*` sources or behind a one-line guard.
 
+## 11e. Control flow is written but UNVERIFIED
+
+`jitc_hip_render()` implements `LoopStart` / `LoopCond` / `LoopEnd` / `LoopPhi` /
+`LoopOutput` and `CondStart` / `CondMid` / `CondEnd`, ported closely from
+`metal_eval.cpp`. It compiles. **Nothing exercises it.**
+
+The subtle part is `LoopEnd`'s back edge. Copying `inner_out -> inner_in`
+naively is wrong when the two sets alias -- an earlier copy clobbers a value a
+later one still needs, a swap being the minimal example -- so every aliasing
+output is staged into a temporary first. It also borrows `Variable::scratch` as
+a marker and MUST clear it, or it corrupts `jitc_var_traverse()`'s visited
+tracking in `jit_eval()`, which would fail somewhere else entirely.
+
+A hand-rolled symbolic-loop test was attempted and removed. `jit_var_loop_end()`
+needs a `jit_record_begin()` checkpoint and may return 0, meaning the body has
+to be recorded a SECOND time after Dr.Jit simplifies the loop state. A test that
+gets that protocol subtly wrong fails for reasons unrelated to codegen, which is
+worse than no test: it points at the wrong suspect.
+
+**The right coverage is to register HIP with the `TEST_*` macros in
+`tests/test.h`**, so the existing `test_loop`, `test_vcall` and `test_basics`
+suites run against this backend. They already encode the protocol correctly and
+would cover far more than a bespoke test. Do that before trusting control flow.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
