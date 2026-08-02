@@ -16,20 +16,32 @@
 
 using AllocInfo = uint64_t;
 
-/// Bit layout: [size : 53][shared : 1][backend : 2][device : 8]
+/// Bit layout: [size : 52][shared : 1][backend : 3][device : 8]
+///
+/// The backend field was 2 bits wide, which silently truncated HIP (== 4) to
+/// JitBackend::None *and* set the neighbouring `shared` bit. jitc_free() then
+/// looked up a thread state for the wrong backend, found none, and took the
+/// "shared allocation after shutdown" escape hatch -- leaking every HIP buffer
+/// while charging it to the host's usage counter. It surfaced as an
+/// out-of-memory in an unrelated test, with no leak warning to point at it.
+///
+/// The bit came out of `size`, which still addresses 4 PiB.
+static_assert((uint32_t) JitBackend::Count <= 8,
+              "AllocInfo: the backend field is 3 bits wide.");
+
 inline AllocInfo alloc_info_encode(size_t size, JitBackend backend, bool shared,
                                    int device) {
-    return (((uint64_t) size)    << 11) |
-           (((uint64_t) shared)  << 10) |
+    return (((uint64_t) size)    << 12) |
+           (((uint64_t) shared)  << 11) |
            (((uint64_t) backend) <<  8) |
             ((uint64_t) device);
 }
 
 inline drjit::tuple<size_t, JitBackend, bool, int>
 alloc_info_decode(AllocInfo v) {
-    return drjit::make_tuple((size_t)     (v >> 11),
-                             (JitBackend)((v >>  8) & 0x3),
-                             (bool)      ((v >> 10) & 0x1),
+    return drjit::make_tuple((size_t)     (v >> 12),
+                             (JitBackend)((v >>  8) & 0x7),
+                             (bool)      ((v >> 11) & 0x1),
                              (int)       ( v        & 0xFF));
 }
 

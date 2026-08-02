@@ -9,6 +9,13 @@
 
 static uint8_t *kernel_params_global = nullptr;
 
+/* Scratch allocations below use `backend` -- the ThreadState's own -- rather
+   than a hardcoded JitBackend::CUDA. Under the shim (PLAN.md §3.5) this class
+   also serves the HIP backend, and a program that initialised only HIP has no
+   CUDA thread state: hardcoding it raises "the CUDA backend is inactive" from
+   deep inside a reduction, which reads like a broken installation rather than
+   a mislabelled allocation. */
+
 static void submit_gpu(KernelType type, KernelRecordingMode recording_mode,
                        CUfunction kernel, uint32_t block_count_x,
                        uint32_t thread_count, uint32_t shared_mem_bytes,
@@ -34,6 +41,9 @@ static void submit_gpu(KernelType type, KernelRecordingMode recording_mode,
         cuda_check(cuStreamSynchronize(stream));
 
     if (unlikely(flags & (uint32_t) JitFlag::KernelHistory)) {
+        // Reports CUDA even for shim-backed HIP launches, which is what
+        // actually ran them; submit_gpu() is a free function with no
+        // ThreadState in scope to say otherwise.
         entry.backend = JitBackend::CUDA;
         entry.type = type;
         entry.recording_mode = recording_mode;
@@ -65,9 +75,9 @@ CUDAThreadState::launch(Kernel kernel, KernelKey & /*key*/,
     if (uses_optix || kernel_param_count > jitc_cuda_arg_limit) {
         size_t param_size = kernel_param_count * sizeof(void *);
         uint8_t *tmp =
-            (uint8_t *) jitc_malloc(JitBackend::CUDA, param_size, true);
+            (uint8_t *) jitc_malloc(backend, param_size, true);
         kernel_params_global =
-            (uint8_t *) jitc_malloc(JitBackend::CUDA, param_size);
+            (uint8_t *) jitc_malloc(backend, param_size);
         std::memcpy(tmp, kernel_params.data(), param_size);
         jitc_memcpy_async(backend, kernel_params_global, tmp, param_size);
         jitc_free(tmp);
@@ -334,7 +344,7 @@ void CUDAThreadState::block_reduce(VarType vt, ReduceOp op, uint32_t size,
     if (chunks_per_block == 1)
         params.out = out;
     else
-        params.out = jitc_malloc(JitBackend::CUDA, chunk_count * tsize);
+        params.out = jitc_malloc(backend, chunk_count * tsize);
 
     {
         scoped_set_context guard(context);
@@ -381,7 +391,7 @@ void CUDAThreadState::reduce_dot(VarType vt, const void *ptr_1,
                    thread_count, shared_size, stream, args, nullptr, size);
     } else {
         // Reduce using multiple blocks
-        void *temp = jitc_malloc(JitBackend::CUDA,
+        void *temp = jitc_malloc(backend,
                                  block_count * (size_t) tsize);
 
         // First reduction
@@ -661,7 +671,7 @@ void CUDAThreadState::block_prefix_reduce(VarType vt, ReduceOp op,
     if (chunks_per_block > 1) {
         uint32_t scratch_size = chunk_count * 2,
                  vsize = type_size[(int) vts];
-        params.scratch = jitc_malloc(JitBackend::CUDA, scratch_size * vsize);
+        params.scratch = jitc_malloc(backend, scratch_size * vsize);
         uint64_t z = 0;
         memset_async(params.scratch, scratch_size, vsize, &z);
     } else {
@@ -689,7 +699,7 @@ uint32_t CUDAThreadState::compress(const uint8_t *in, uint32_t size,
     scoped_set_context guard(context);
 
     uint32_t *count_out = (uint32_t *) jitc_malloc(
-        JitBackend::CUDA, sizeof(uint32_t), /*shared=*/true);
+        backend, sizeof(uint32_t), /*shared=*/true);
 
     if (size <= 4096) {
         // Kernel for small arrays
@@ -731,7 +741,7 @@ uint32_t CUDAThreadState::compress(const uint8_t *in, uint32_t size,
                 thread_count, shared_size, scratch_items * 4);
 
         uint64_t *scratch = (uint64_t *) jitc_malloc(
-            JitBackend::CUDA, scratch_items * sizeof(uint64_t));
+            backend, scratch_items * sizeof(uint64_t));
 
         // Initialize scratch space and padding
         uint32_t block_count_init, thread_count_init;
@@ -868,14 +878,14 @@ uint32_t CUDAThreadState::block_mkperm(const uint32_t *ptr, uint32_t size,
     bool needs_transpose = rows_per_group > 1;
     uint32_t *buckets_1, *buckets_2, *counter = nullptr;
     buckets_1 = buckets_2 =
-        (uint32_t *) jitc_malloc(JitBackend::CUDA, bucket_size_all);
+        (uint32_t *) jitc_malloc(backend, bucket_size_all);
 
     // Scratch space for matrix transpose operation
     if (needs_transpose)
-        buckets_2 = (uint32_t *) jitc_malloc(JitBackend::CUDA, bucket_size_all);
+        buckets_2 = (uint32_t *) jitc_malloc(backend, bucket_size_all);
 
     if (offsets) {
-        counter = (uint32_t *) jitc_malloc(JitBackend::CUDA, sizeof(uint32_t)),
+        counter = (uint32_t *) jitc_malloc(backend, sizeof(uint32_t)),
         cuda_check(cuMemsetD8Async((CUdeviceptr) counter, 0, sizeof(uint32_t),
                                    stream));
     }

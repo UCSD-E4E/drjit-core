@@ -1429,13 +1429,19 @@ template <typename T> inline bool jitc_is_llvm(T b) {
     return (JitBackend) b == JitBackend::LLVM;
 }
 
-/// True when a backend should take the CUDA allocation/launch path.
+/// True when a backend's device work is serviced by the CUDA runtime.
 ///
-/// Under the CUDA shim (PLAN.md §0.3) the HIP backend is serviced by
-/// CUDAThreadState, so its memory must come from the CUDA allocator too. This
-/// exists so the shim needs one predicate change rather than a scattering of
-/// `|| jitc_is_hip(...)` at every malloc site.
-template <typename T> inline bool jitc_is_cuda_alloc(T b) {
+/// Under the CUDA shim (PLAN.md §0.3) a HIPThreadState IS a CUDAThreadState,
+/// so its `context`, `stream` and `event` are CUDA handles and every site that
+/// allocates, launches or SYNCHRONISES must treat it as CUDA. Omitting a sync
+/// site does not fail loudly -- the host simply reads pinned memory before the
+/// copy into it has landed, which looks like a wrong reduction result rather
+/// than a missing synchronisation.
+///
+/// This predicate exists so the shim needs one change rather than a scattering
+/// of `|| jitc_is_hip(...)`; it is deliberately false without the shim, where
+/// the real HIP runtime path (Phase 1) has to supply its own.
+template <typename T> inline bool jitc_is_cuda_backed(T b) {
 #if defined(DRJIT_HIP_CUDA_SHIM)
     return jitc_is_cuda(b) || jitc_is_hip(b);
 #else

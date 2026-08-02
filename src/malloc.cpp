@@ -126,7 +126,7 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
     ThreadState *ts = nullptr;
     int device = 0;
 #if defined(DRJIT_ENABLE_CUDA)
-    if (jitc_is_cuda_alloc(backend)) {
+    if (jitc_is_cuda_backed(backend)) {
         ts = thread_state(backend);
         device = ts->device;
     }
@@ -175,7 +175,7 @@ void* jitc_malloc(JitBackend backend, size_t size, bool shared) {
 #endif
 
 #if defined(DRJIT_ENABLE_CUDA)
-                } else if (jitc_is_cuda_alloc(backend)) {
+                } else if (jitc_is_cuda_backed(backend)) {
                     scoped_set_context guard_2(ts->context);
                     CUresult ret;
 
@@ -408,11 +408,18 @@ void* jitc_malloc_migrate(void *ptr, JitBackend dst_backend, int move) {
     }
 #endif
 #if defined(DRJIT_ENABLE_CUDA)
-    if (jitc_is_cuda_alloc(gpu_backend)) {
+    if (jitc_is_cuda_backed(gpu_backend)) {
         scoped_set_context guard(ts->context);
         if (src_backend == JitBackend::None) {
-            // Stage host -> device copies through a shared buffer
-            void *tmp = jitc_malloc(JitBackend::CUDA, size, /*shared=*/true);
+            // Stage host -> device copies through a shared buffer.
+            //
+            // gpu_backend, not JitBackend::CUDA: jitc_free() routes a shared
+            // allocation to its own backend's thread state and DELIBERATELY
+            // leaks it when that state does not exist. A program using only
+            // the HIP backend has no ts_cuda, so hardcoding CUDA here leaked
+            // one pinned staging buffer per host->device migration -- which
+            // surfaces as an out-of-memory much later, in unrelated code.
+            void *tmp = jitc_malloc(gpu_backend, size, /*shared=*/true);
             memcpy(tmp, ptr, size);
             cuda_check(cuMemcpyAsync((CUdeviceptr) ptr_new,
                                      (CUdeviceptr) tmp, size,
@@ -486,7 +493,10 @@ void jitc_flush_malloc_cache(bool warn) {
             }
 
 #if defined(DRJIT_ENABLE_CUDA)
-            if (jitc_is_cuda(backend) &&
+            // jitc_is_cuda_backed, not jitc_is_cuda: under the shim these
+            // entries were allocated by the cuMem* branch above, so freeing
+            // them any other way (or not at all) leaks device memory silently.
+            if (jitc_is_cuda_backed(backend) &&
                 (state.backends & (1u << (uint32_t) JitBackend::CUDA))) {
                 const CUDADevice &dev = state.devices[device];
                 scoped_set_context guard2(dev.context);

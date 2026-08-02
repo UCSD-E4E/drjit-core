@@ -65,6 +65,18 @@ if (DRJIT_ENABLE_HIP)
   add_test(NAME hip_types COMMAND hip_types
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
+  # Packed backend fields. Pure lookup/arithmetic, no device needed.
+  add_executable(hip_packing hip_packing.cpp)
+  set_property(TARGET hip_packing PROPERTY CXX_STANDARD 17)
+  # src/malloc.h reaches into the internal hash map and hashing types.
+  target_include_directories(hip_packing PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ext/robin_map/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ext/lz4)
+  target_link_libraries(hip_packing PRIVATE drjit-core)
+  add_test(NAME hip_packing COMMAND hip_packing
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+
   # Kernel prologue. Pure, no device needed.
   add_executable(hip_prologue hip_prologue.cpp)
   set_property(TARGET hip_prologue PROPERTY CXX_STANDARD 17)

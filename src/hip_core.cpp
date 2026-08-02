@@ -45,17 +45,23 @@ extern bool jitc_cuda_init();
 bool jitc_hip_init() {
 #if defined(DRJIT_HIP_CUDA_SHIM)
     // Piggy-back on the CUDA backend's device discovery.
-    if (state.devices.empty()) {
-        if (!jitc_cuda_init()) {
-            jitc_log(Info, "jit_hip_init(): CUDA shim requested but no CUDA "
-                           "device is available.");
-            return false;
-        }
-        state.backends |= 1u << (uint32_t) JitBackend::CUDA;
+    if (state.devices.empty() && !jitc_cuda_init()) {
+        jitc_log(Info, "jit_hip_init(): CUDA shim requested but no CUDA "
+                       "device is available.");
+        return false;
     }
 
     if (state.devices.empty())
         return false;
+
+    // Unconditionally, not just when this call performed the discovery. The
+    // flag is what tells the allocator that the CUDA runtime is live, and
+    // jit_shutdown(light) clears it while leaving state.devices populated --
+    // so on a second jit_init(HIP) the discovery is skipped, the flag stays
+    // clear, and jitc_flush_malloc_cache() silently drops every HIP allocation
+    // on the floor instead of freeing it. That shows up as an out-of-memory
+    // several tests later, nowhere near the cause.
+    state.backends |= 1u << (uint32_t) JitBackend::CUDA;
 
     HIPDevice dev { };
     dev.id      = 0;

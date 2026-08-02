@@ -480,13 +480,23 @@ static void jitc_hip_render(Variable *v) {
             // cast or __builtin_bit_cast -- the latter is Clang-only and NVRTC
             // rejects it (BACKEND_NOTES §11a).
             //
-            // Only ONE side can be floating point: the two types have the same
-            // width but differ, so f32/f64 never face each other. When NEITHER
-            // is, there is nothing to reinterpret -- a plain cast between two
-            // same-width integers already yields the bit pattern. Reaching for
-            // a float intrinsic there converts the value first, turning
-            // Int64(6) into 0x40c00000 (spec_cast.hip bit 14).
-            const char *fn = jitc_is_float(a) ? to_bits_fn(a) : from_bits_fn(v);
+            // Reinterpretation is needed only when EXACTLY ONE side is
+            // floating point. Otherwise a plain cast is already exact: between
+            // two same-width integers it yields the bit pattern, and a
+            // same-type bitcast (which Dr.Jit does emit -- see the size-1
+            // gather in tests/mem.cpp) is a copy.
+            //
+            // Reaching for a float intrinsic in either of those cases converts
+            // the VALUE first. `(f32) __float_as_uint(x)` turns 1.0f into
+            // 1065353216.0f, and Int64(6) into 0x40c00000 (spec_cast.hip
+            // bit 14) -- both compile and run.
+            bool a_flt = jitc_is_float(a), v_flt = jitc_is_float(v);
+            const char *fn = nullptr;
+            if (a_flt && !v_flt)
+                fn = to_bits_fn(a);
+            else if (!a_flt && v_flt)
+                fn = from_bits_fn(v);
+
             if (fn)
                 fmt("$t $v = ($t) $s($v);\n", v, v, v, fn, a);
             else

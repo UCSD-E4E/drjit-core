@@ -183,7 +183,7 @@ void jitc_shutdown(int light) {
     // Synchronize with everything
     for (ThreadState *ts : state.tss) {
 #if defined(DRJIT_ENABLE_CUDA)
-        if (jitc_is_cuda(ts->backend)) {
+        if (jitc_is_cuda_backed(ts->backend)) {
             scoped_set_context guard(ts->context);
             cuda_check(cuStreamSynchronize(ts->stream));
         }
@@ -232,7 +232,7 @@ void jitc_shutdown(int light) {
             auto [size, backend, shared, device] = alloc_info_decode(it->first);
             (void) device;
 
-            if (!jitc_is_cuda(backend) || shared)
+            if (!jitc_is_cuda_backed(backend) || shared)
                 continue;
 
             std::vector<void *> entries;
@@ -262,7 +262,7 @@ void jitc_shutdown(int light) {
                 jitc_var_dec_ref(index);
 
 #if defined(DRJIT_ENABLE_CUDA)
-            if (jitc_is_cuda(ts->backend) && ts->stream) {
+            if (jitc_is_cuda_backed(ts->backend) && ts->stream) {
                 scoped_set_context guard(ts->context);
                 cuda_check(cuStreamSynchronize(ts->stream));
             }
@@ -601,7 +601,7 @@ void jitc_sync_thread(ThreadState *ts) {
     ts->actual_state()->flush_deferred_free();
 
 #if defined(DRJIT_ENABLE_CUDA)
-    if (jitc_is_cuda(backend)) {
+    if (jitc_is_cuda_backed(backend)) {
         scoped_set_context guard(ts->context);
         CUstream stream = ts->stream;
         unlock_guard guard_2(state.lock);
@@ -678,8 +678,17 @@ void jitc_flush_thread() {
 void jitc_sync_device() {
     ThreadLocal &tl = jitc_thread_local();
 #if defined(DRJIT_ENABLE_CUDA)
-    ThreadState *ts = tl.ts_cuda;
-    if (ts) {
+    // ts_hip as well: a program using only the HIP backend has no ts_cuda, and
+    // synchronizing nothing at all is indistinguishable from success.
+    ThreadState *cuda_like[] = {
+        tl.ts_cuda,
+#  if defined(DRJIT_HIP_CUDA_SHIM)
+        tl.ts_hip,
+#  endif
+    };
+    for (ThreadState *ts : cuda_like) {
+        if (!ts)
+            continue;
         /* Release lock while synchronizing */ {
             unlock_guard guard(state.lock);
             scoped_set_context guard2(ts->context);
