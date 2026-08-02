@@ -199,12 +199,43 @@ still runs identically on the shim (different register file entirely), and
 surfaces as halved MI210 throughput much later. `hip_validate` now prints
 register and scratch usage for **every** kernel for this reason.
 
-**Still unverifiable without an MI210:** whether traversal returns correct
-hits, and the whole host-side API (context creation, geometry build). The
-packaged HIP-RT ships AMD-only device libraries and its host library dlopens
-`libamdhip64` with no CUDA paths, so despite the `hiprtDeviceNVIDIA` enum there
-is no NVIDIA arm to run. `run_tests.sh` prints this as a separate, stronger
-caveat than the wave64 list.
+### 7b. Traversal IS executed, on NVIDIA -- and it is a good proxy
+
+The first draft of §7a said hit correctness was unverifiable without an MI210,
+because "the packaged HIP-RT is AMD-only". That was true of the PACKAGE and
+false of HIP-RT: upstream supports NVIDIA through Orochi, and nixpkgs disables
+it in three independent places (see the `hipRtNv` derivation in flake.nix).
+
+With those undone, `hiprt_triangle.cpp` builds a real BVH on the device,
+compiles a traversal kernel through NVRTC, launches it, and checks the results:
+
+```
+lane 0 (inside):  hit=1 t=1.000   want hit=1 t=1.000
+lane 1 (outside): hit=0 t=-1.000  want hit=0 t=-1.000
+TRAVERSAL CORRECT
+```
+
+**This is an unusually good cross-vendor proxy, for the reason in §7a:** gfx90a
+has no ray-tracing hardware, so it takes HIP-RT's RTIP 0 SOFTWARE path -- the
+same portable C++ that compiles for NVIDIA. An RDNA card would take the
+hardware branch and prove much less. What it still does not cover: wave64 (this
+runs at 32) and the AMD host API.
+
+Three NVIDIA artifacts are required and missing any one fails late and
+unhelpfully -- `hiprtErrorInternal`, with the actual filename visible only
+after `hiprtSetLogLevel()`:
+
+| file | role |
+|---|---|
+| `hiprt*_nv_lib.fatbin` | traversal library linked into user kernels |
+| `hiprt*_nv.fatbin` | precompiled BVH-BUILDER kernels |
+| `oro_compiled_kernels.fatbin` | Orochi parallel primitives |
+
+Also: `hiprtBuildTraceKernels()` takes compiler options, and NVRTC starts with
+an empty include search list -- pass `-I/include` or the kernel
+cannot find `hiprt_types.h`.
+
+**Still needs an MI210:** wave64 semantics, fp16 numerics, and the AMD host API.
 
 ---
 

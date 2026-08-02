@@ -85,6 +85,29 @@ if [ -n "${HIPNV_CFLAGS:-}" ] && command -v nvcc >/dev/null 2>&1; then
   fi
 fi
 
+# --- HIP-RT traversal, actually executed (BACKEND_NOTES §7a) ----------------
+#
+# Needs $HIPRT_NV_PATH: the CUDA-enabled HIP-RT build, which the stock nixpkgs
+# package is not. gfx90a takes HIP-RT's RTIP 0 SOFTWARE traversal path, so
+# NVIDIA runs very nearly the same code the MI210 will -- which is what makes
+# this worth having rather than a curiosity.
+if [ -n "${HIPRT_NV_PATH:-}" ] && [ -n "${CUDA_INCLUDE:-}" ]; then
+  SRC="$(dirname "$0")/hiprt_triangle.cpp"
+  BIN=/tmp/hiprt_triangle
+  if g++ -std=c++17 -I"$HIPRT_NV_PATH/include" -I"$CUDA_INCLUDE" "$SRC" \
+        -L"$HIPRT_NV_PATH/lib" -lhiprt64 -L/run/opengl-driver/lib -lcuda \
+        -o "$BIN" >/dev/null 2>&1 &&
+     HIPRT_PATH="$HIPRT_NV_PATH" \
+     LD_LIBRARY_PATH="$HIPRT_NV_PATH/lib:/run/opengl-driver/lib:${NVRTC_LIB:-}:$LD_LIBRARY_PATH" \
+        "$BIN" >/dev/null 2>&1; then
+    printf "  %-20s PASS  (BVH built + traversed on NVIDIA, hits verified)\n" "hiprt_triangle"
+    pass=$((pass+1))
+  else
+    printf "  %-20s FAIL  (HIP-RT traversal broken)\n" "hiprt_triangle"
+    fail=$((fail+1))
+  fi
+fi
+
 # --- The wave64/fp16 unverified list (PLAN.md §0.3, §7.2) -------------------
 #
 # The execution arm runs at warp 32 and aliases fp16 to float, so kernels that
@@ -114,10 +137,11 @@ for k in "$DIR"/*.hip; do
 done
 if [ -n "$rt" ]; then
   echo
-  echo "  NEVER EXECUTED (compiled and linked for gfx90a only):"
+  echo "  COMPILED AND LINKED FOR gfx90a, NOT EXECUTED:"
   for u in $rt; do echo "    - $u"; done
-  echo "    reason: packaged HIP-RT is AMD-only; there is no NVIDIA arm to run."
-  echo "    Hit correctness is unverified until an MI210 is present."
+  echo "    reason: hip_validate's exec arm is plain NVRTC with no HIP-RT."
+  echo "    Traversal CORRECTNESS is covered separately by hiprt_triangle,"
+  echo "    which builds a BVH and traces on NVIDIA via \$HIPRT_NV_PATH."
 fi
 echo
 
