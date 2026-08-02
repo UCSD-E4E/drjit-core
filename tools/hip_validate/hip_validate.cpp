@@ -304,7 +304,13 @@ static bool run_exec_arm(const Options &o, const std::string &kernel_src,
     std::vector<float> in = make_input(o.n);
     CUdeviceptr d_out = 0, d_in = 0;
     size_t bytes = (size_t) o.n * sizeof(float);
-    if (cuMemAlloc(&d_out, bytes) || cuMemAlloc(&d_in, bytes) ||
+
+    // `out` is over-allocated: everything past out[n] is SCRATCH, and only the
+    // first n elements are read back. Kernels exercising 8-byte atomics need a
+    // lane-exclusive slot wider than their own output element, and carving it
+    // out of out[0..n) would make neighbouring lanes race (see spec_memory.hip).
+    // 4x leaves room for one 8-byte slot per lane with margin.
+    if (cuMemAlloc(&d_out, bytes * 4) || cuMemAlloc(&d_in, bytes) ||
         cuMemcpyHtoD(d_in, in.data(), bytes)) {
         printf("  [exec] FAIL  device allocation\n"); return false;
     }

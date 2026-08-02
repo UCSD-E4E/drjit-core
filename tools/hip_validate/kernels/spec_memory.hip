@@ -121,5 +121,88 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     float r19 = atomicAdd(r18, 1.5f);
     if (r19 != 0.0f || *r18 != 1.5f) err |= 1u << 9;
 
+    // --- Scatter-reduce ------------------------------------------------------
+    //
+    // VarKind::Scatter with a ReduceOp other than Identity. The C++ atomics are
+    // OVERLOAD SETS, not a uniform family, and the gaps are what the emitter
+    // has to route around:
+    //
+    //   * atomicAdd has no `long long` overload -- only `unsigned long long`.
+    //     Passing a signed 64-bit pointer does not compile.
+    //   * atomicMin/Max/And/Or have NO floating-point overload at all.
+    //   * atomicMul does not exist for any type.
+    //
+    // Each lane still owns its own slot, so the values are deterministic. The
+    // 8-byte slots come from the SCRATCH region past out[n] -- see the
+    // over-allocation in hip_validate.cpp. Carving them out of out[0..n) would
+    // make each lane's 8-byte slot overlap its neighbour's 4-byte one, and the
+    // resulting failures would look like broken atomics rather than a broken
+    // test.
+    uint64_t r10s = (uint64_t) (out + n);
+
+    // Add, on the signed 64-bit type, through an unsigned pointer. Two's
+    // complement makes the reinterpretation exact for addition.
+    unsigned long long *r20 = (unsigned long long *) r10s + r0;
+    *r20 = 0ull;
+    atomicAdd(r20, (unsigned long long) (long long) -3);
+    if ((long long) *r20 != -3) err |= 1u << 10;
+
+    // Min / Max / And / Or on integers.
+    uint32_t *r21 = (uint32_t *) r10 + r0;
+    *r21 = 10u;
+    atomicMin(r21, 4u);
+    if (*r21 != 4u) err |= 1u << 11;
+    atomicMax(r21, 7u);
+    if (*r21 != 7u) err |= 1u << 12;
+    atomicAnd(r21, 0xcu);
+    if (*r21 != 4u) err |= 1u << 13;
+    atomicOr(r21, 0x1u);
+    if (*r21 != 5u) err |= 1u << 14;
+
+    // Float min via a compare-and-swap loop, which is the only portable form:
+    // there is no atomicMin(float*, float). The loop must re-read the OLD value
+    // returned by atomicCAS rather than reloading the address, or two racing
+    // lanes can both observe a stale value and one update is lost.
+    float *r22 = (float *) r10 + r0;
+    *r22 = 10.0f;
+    {
+        uint32_t *addr = (uint32_t *) r22;
+        uint32_t old = *addr, assumed;
+        do {
+            assumed = old;
+            float nv = fminf(__uint_as_float(assumed), 4.5f);
+            old = atomicCAS(addr, assumed, __float_as_uint(nv));
+        } while (assumed != old);
+    }
+    if (*r22 != 4.5f) err |= 1u << 15;
+
+    // Same shape at 64 bits: the CAS width must follow the VALUE width, not
+    // default to 32, or the loop spins on half of a double forever.
+    double *r23 = (double *) r10s + r0;
+    *r23 = 10.0;
+    {
+        unsigned long long *addr = (unsigned long long *) r23;
+        unsigned long long old = *addr, assumed;
+        do {
+            assumed = old;
+            double nv = fmax(__longlong_as_double((long long) assumed), 12.5);
+            old = atomicCAS(addr, assumed,
+                            (unsigned long long) __double_as_longlong(nv));
+        } while (assumed != old);
+    }
+    if (*r23 != 12.5) err |= 1u << 16;
+
+    // Multiplication has no atomic anywhere, so it uses the same loop.
+    uint32_t *r24 = (uint32_t *) r10 + r0;
+    *r24 = 3u;
+    {
+        uint32_t old = *r24, assumed;
+        do {
+            assumed = old;
+            old = atomicCAS(r24, assumed, assumed * 7u);
+        } while (assumed != old);
+    }
+    if (*r24 != 21u) err |= 1u << 17;
+
     out[r0] = (float) err;
 }

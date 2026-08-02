@@ -143,6 +143,124 @@ static void render_bitwise(Variable *v, const char *op) {
         fmt("$t $v = $v $s $v;\n", v, v, a0, op, a1);
 }
 
+/// Emit a scatter-reduce (VarKind::Scatter with a non-Identity ReduceOp).
+///
+/// HIP/CUDA C++ expose atomics as an OVERLOAD SET with holes in it, not a
+/// uniform family. Each hole below is a compile error rather than a wrong
+/// answer -- except the first, which is why it is called out:
+///
+///   * atomicAdd has no `long long` overload, only `unsigned long long`.
+///     Two's complement makes the reinterpretation exact for addition.
+///   * atomicMin/Max/And/Or have no floating-point overload at all.
+///   * atomicMul does not exist for any type.
+///
+/// Anything without a native form goes through a compare-and-swap loop over
+/// the value's binary view. The loop must re-use the old value RETURNED by
+/// atomicCAS rather than reloading the address: reloading lets two racing
+/// lanes both observe a stale value, and one update is silently lost.
+///
+/// Both shapes are checked on gfx90a and NVIDIA by spec_memory.hip.
+///
+/// ReduceMode::Local (warp-level pre-aggregation, which the CUDA and Metal
+/// backends implement) is deliberately ignored. Plain atomics are always
+/// correct, just slower under heavy contention; adding the aggregation is a
+/// performance task and belongs after the backend is correct.
+static void render_scatter_reduce(ReduceOp op, Variable *ptr, Variable *value,
+                                  Variable *index) {
+    VarType vt = (VarType) value->type;
+    uint32_t width = type_size[(int) vt];
+    bool is_float = jitc_is_float(value),
+         is_int   = !is_float && (vt != VarType::Bool);
+
+    if (width != 4 && width != 8)
+        jitc_fail("jitc_hip_render(): scatter-reduce on a %u-byte type is not "
+                  "supported -- atomicCAS exists only at 32 and 64 bits, so "
+                  "there is no correct lowering. (Dr.Jit normally widens these "
+                  "before reaching the backend; if this fires, it did not.)",
+                  width);
+    if ((VarType) value->type == VarType::Float16)
+        jitc_fail("jitc_hip_render(): scatter-reduce on Float16 is not "
+                  "implemented -- there is no 16-bit atomicCAS, so it needs "
+                  "the packed f16x2 treatment the CUDA backend uses.");
+
+    // --- Native atomics ------------------------------------------------------
+    const char *fn = nullptr;
+    bool via_u64 = false;   // route a signed 64-bit add through the unsigned form
+
+    switch (op) {
+        case ReduceOp::Add:
+            fn = "atomicAdd";
+            via_u64 = (vt == VarType::Int64);
+            break;
+
+        case ReduceOp::Min: fn = is_int ? "atomicMin" : nullptr; break;
+        case ReduceOp::Max: fn = is_int ? "atomicMax" : nullptr; break;
+        case ReduceOp::And: fn = is_int ? "atomicAnd" : nullptr; break;
+        case ReduceOp::Or:  fn = is_int ? "atomicOr"  : nullptr; break;
+
+        // No atomicMul anywhere.
+        case ReduceOp::Mul: fn = nullptr; break;
+
+        default:
+            jitc_fail("jitc_hip_render(): unhandled scatter-reduce operation "
+                      "(%u).", (uint32_t) op);
+    }
+
+    if (fn) {
+        if (via_u64)
+            fmt("    $s(($b *) (($t *) $v + $v), ($b) $v);\n",
+                fn, value, value, ptr, index, value, value);
+        else
+            fmt("    $s(($t *) $v + $v, $v);\n",
+                fn, value, ptr, index, value);
+        return;
+    }
+
+    // --- Compare-and-swap loop ----------------------------------------------
+    //
+    // The CAS width follows the VALUE width ($b is the same-width unsigned
+    // integer): a 32-bit CAS on a double would spin on half of it forever.
+    fmt("    $b *_a = ($b *) (($t *) $v + $v);\n"
+        "    $b _o = *_a, _s;\n"
+        "    do {\n"
+        "        _s = _o;\n",
+        value, value, value, ptr, index,
+        value);
+
+    // Recombine through the binary view. from/to_bits are no-ops for integers.
+    const char *from = from_bits_fn(value), *to = to_bits_fn(value);
+    if (from)
+        fmt("        $t _x = $s(_s);\n", value, from);
+    else
+        fmt("        $t _x = ($t) _s;\n", value, value);
+
+    switch (op) {
+        case ReduceOp::Mul:
+            fmt("        $t _n = _x * $v;\n", value, value);
+            break;
+        case ReduceOp::Min:
+            if (is_f64(value)) fmt("        $t _n = fmin(_x, $v);\n", value, value);
+            else               fmt("        $t _n = fminf(_x, $v);\n", value, value);
+            break;
+        case ReduceOp::Max:
+            if (is_f64(value)) fmt("        $t _n = fmax(_x, $v);\n", value, value);
+            else               fmt("        $t _n = fmaxf(_x, $v);\n", value, value);
+            break;
+        default:
+            jitc_fail("jitc_hip_render(): scatter-reduce fell through to the "
+                      "CAS loop with an operation that has a native atomic "
+                      "(%u) -- the two tables above have drifted apart.",
+                      (uint32_t) op);
+    }
+
+    if (to)
+        fmt("        _o = atomicCAS(_a, _s, ($b) $s(_n));\n", value, to);
+    else
+        fmt("        _o = atomicCAS(_a, _s, ($b) _n);\n", value);
+
+    put("    } while (_s != _o);\n");
+}
+
 /// Emit a math call, choosing the double or float spelling by operand type.
 /// `base` is the double name; the float form is `base` + "f".
 static void render_math(Variable *v, const char *base, uint32_t n_args = 1) {
@@ -411,19 +529,21 @@ static void jitc_hip_render(Variable *v) {
             ReduceOp op = (ReduceOp) (uint32_t) v->literal;
             bool unmasked = mask->is_literal() && mask->literal == 1;
 
-            if (op != ReduceOp::Identity)
-                jitc_fail("jitc_hip_render(): scatter-reduce is not implemented "
-                          "yet. The atomic forms and their return-value "
-                          "conventions are specified in "
-                          "tools/hip_validate/kernels/spec_memory.hip; note "
-                          "they must target GLOBAL memory, never a "
-                          "materialised temporary.");
+            if (op == ReduceOp::Identity) {
+                if (unmasked)
+                    fmt("(($t *) $v)[$v] = $v;\n", value, ptr, index, value);
+                else
+                    fmt("if ($v) (($t *) $v)[$v] = $v;\n",
+                        mask, value, ptr, index, value);
+                break;
+            }
 
-            if (unmasked)
-                fmt("(($t *) $v)[$v] = $v;\n", value, ptr, index, value);
+            if (!unmasked)
+                fmt("if ($v) {\n", mask);
             else
-                fmt("if ($v) (($t *) $v)[$v] = $v;\n",
-                    mask, value, ptr, index, value);
+                put("{\n");
+            render_scatter_reduce(op, ptr, value, index);
+            put("}\n");
             break;
         }
 
