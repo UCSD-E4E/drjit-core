@@ -41,6 +41,8 @@ int rocm_attr_max_shmem();      int rocm_attr_pci_bus_id();
 int rocm_attr_mem_pools();      int rocm_attr_unified_addr();
 int rocm_success();             int rocm_stream_nonblocking();
 int rocm_event_disable_timing(); int rocm_host_malloc_default();
+int rocm_prop_size();           int rocm_prop_gcn_arch_off();
+int rocm_prop_gcn_arch_size();
 }
 #endif
 
@@ -134,6 +136,19 @@ int main(int, char **) {
           "hipEventDisableTiming matches");
     check(hipHostMallocDefault == rocm_host_malloc_default(),
           "hipHostMallocDefault matches");
+
+    // hipDeviceProp_t layout. hip_core.cpp reads gcnArchName out of an opaque
+    // byte buffer at a fixed offset rather than transcribing ~100 unstable
+    // fields, so these three numbers ARE the contract. A ROCm release that
+    // moves the field would otherwise yield a garbage architecture string --
+    // and a garbage arch means the wrong kernel-cache key and the wrong
+    // codegen target, silently.
+    check(DR_HIP_PROP_SIZE == rocm_prop_size(),
+          "sizeof(hipDeviceProp_t) matches");
+    check(DR_HIP_PROP_GCN_ARCH_OFFSET == rocm_prop_gcn_arch_off(),
+          "offsetof(gcnArchName) matches");
+    check(DR_HIP_PROP_GCN_ARCH_SIZE == rocm_prop_gcn_arch_size(),
+          "sizeof(gcnArchName) matches");
 
     // The trap this test exists for: these must NOT be CUDA's numbers. If a
     // future edit "simplifies" them back to the CUDA values, every device

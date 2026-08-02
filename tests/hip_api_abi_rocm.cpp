@@ -17,6 +17,7 @@
 #if defined(DRJIT_HIP_HAVE_HEADERS)
 
 #include <hip/hip_runtime_api.h>
+#include <cstddef>
 
 extern "C" {
 
@@ -30,6 +31,14 @@ int rocm_attr_mem_pools()     { return (int) hipDeviceAttributeMemoryPoolsSuppor
 int rocm_attr_unified_addr()  { return (int) hipDeviceAttributeUnifiedAddressing; }
 
 int rocm_success()            { return (int) hipSuccess; }
+
+// hipDeviceProp_t layout. hip_core.cpp treats the struct as opaque bytes and
+// reads gcnArchName at a fixed offset rather than transcribing ~100 fields, so
+// these two numbers are the entire contract -- and getting them wrong yields a
+// nonsense architecture string with no error anywhere.
+int rocm_prop_size()          { return (int) sizeof(hipDeviceProp_t); }
+int rocm_prop_gcn_arch_off()  { return (int) offsetof(hipDeviceProp_t, gcnArchName); }
+int rocm_prop_gcn_arch_size() { return (int) sizeof(((hipDeviceProp_t *) 0)->gcnArchName); }
 int rocm_stream_nonblocking() { return (int) hipStreamNonBlocking; }
 int rocm_event_disable_timing() { return (int) hipEventDisableTiming; }
 int rocm_host_malloc_default(){ return (int) hipHostMallocDefault; }

@@ -81,6 +81,13 @@ struct hipMemPool_st;  using hipMemPool_t  = hipMemPool_st *;
 #define hipDeviceAttributeMemoryPoolsSupported      88
 #define hipDeviceAttributeConcurrentManagedAccess    9
 
+// hipDeviceProp_t layout, for the opaque-buffer access in hip_core.cpp. See
+// the long comment there for why the struct is not transcribed. Verified
+// against ROCm's real header by tests/hip_api_abi.cpp.
+#define DR_HIP_PROP_SIZE                          1472
+#define DR_HIP_PROP_GCN_ARCH_OFFSET               1160
+#define DR_HIP_PROP_GCN_ARCH_SIZE                  256
+
 #define hipStreamNonBlocking                         1
 #define hipEventDisableTiming                        2
 #define hipHostMallocDefault                         0

@@ -3,9 +3,11 @@
 
     Two modes:
 
-    REAL (default). Enumerates AMD devices through the HIP runtime. Lands in
-    Phase 1 as the mechanical cu* -> hip* port of cuda_api.cpp / cuda_core.cpp
-    (PLAN.md §4). Not implemented yet.
+    REAL (default). Enumerates AMD devices through the HIP runtime, via the
+    dlopen'd bindings in hip_api.{h,cpp}. Implemented; what it cannot do on a
+    machine without an AMD GPU is get past hipInit(), which then reports
+    "no ROCm-capable device is detected" and leaves the backend unavailable.
+    The remaining Phase 1 piece is HIPThreadState (alloc/launch/memcpy).
 
     SHIM (-DDRJIT_HIP_CUDA_SHIM=1). A DEVELOPMENT SCAFFOLD that backs the HIP
     backend with the CUDA runtime so the whole pipeline -- codegen, compile,
@@ -80,12 +82,9 @@ static bool jitc_hip_fail(const char *what, hipError_t rv) {
 //      transcription risk for the two values we need. Instead we allocate a
 //      generously-sized zeroed buffer and read the one field by byte offset.
 //
-// Both constants below are checked against ROCm's real header by
-// tests/hip_api_abi.cpp, so a layout change fails loudly instead of yielding a
-// nonsense architecture.
-#define DR_HIP_PROP_SIZE            1472   /* sizeof(hipDeviceProp_tR0600) */
-#define DR_HIP_PROP_GCN_ARCH_OFFSET 1160   /* offsetof(.., gcnArchName)    */
-#define DR_HIP_PROP_GCN_ARCH_SIZE    256
+// The two constants live in hip_api.h so tests/hip_api_abi.cpp can check them
+// against ROCm's real header -- a layout change then fails loudly instead of
+// yielding a nonsense architecture.
 
 static hipError_t (*hipGetDevicePropertiesR0600)(void *, int) = nullptr;
 
