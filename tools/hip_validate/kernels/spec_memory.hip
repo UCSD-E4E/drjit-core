@@ -204,5 +204,36 @@ DRJIT_KERNEL void k(float *out, const float *in, unsigned n) {
     }
     if (*r24 != 21u) err |= 1u << 17;
 
+    // --- Atomics on floating point, through the binary view ------------------
+    //
+    // atomicExch and atomicCAS have integer overloads only (plus a float
+    // atomicExch, but nothing at 64 bits), so ScatterExch/ScatterCAS on a
+    // float have to reinterpret. Composed here rather than trusting that
+    // "__float_as_uint works" and "atomicExch works" implies the combination:
+    // the trap is doing the reinterpretation on the POINTER instead of the
+    // value, which compiles and scales the index by the wrong element size.
+    float *r25f = (float *) r10 + r0;
+    *r25f = 1.5f;
+    {
+        uint32_t *addr = (uint32_t *) r25f;
+        float old = __uint_as_float(atomicExch(addr, __float_as_uint(2.5f)));
+        if (old != 1.5f || *r25f != 2.5f) err |= 1u << 18;
+    }
+
+    // CAS returns the OLD value; "did it swap" is old == expected, not the
+    // return value itself.
+    {
+        uint32_t *addr = (uint32_t *) r25f;
+        uint32_t expected = __float_as_uint(2.5f);
+        uint32_t prev = atomicCAS(addr, expected, __float_as_uint(9.5f));
+        if (__uint_as_float(prev) != 2.5f || prev != expected || *r25f != 9.5f)
+            err |= 1u << 19;
+
+        // A mismatched comparand: no write, and the "swapped" test is false.
+        uint32_t prev2 = atomicCAS(addr, __float_as_uint(0.5f),
+                                   __float_as_uint(3.5f));
+        if (prev2 == __float_as_uint(0.5f) || *r25f != 9.5f) err |= 1u << 20;
+    }
+
     out[r0] = (float) err;
 }

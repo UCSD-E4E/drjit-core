@@ -28,6 +28,7 @@
 #include "call.h"        // jitc_call_upload
 #include "loop.h"        // LoopData
 #include "cond.h"        // CondData, jitc_cond_output_active
+#include "op.h"          // ScatterCASDData
 #include <cstring>
 #include "hip.h"
 #include "hip_eval.h"
@@ -78,11 +79,6 @@ static void render_call(Variable *v, const char *fn, uint32_t n_args) {
     if (n_args >= 3)
         fmt(", $v", jitc_var(v->dep[2]));
     put(");\n");
-}
-
-/// Pick between the float and integer spelling of an operation.
-static void render_fp_or_int(Variable *v, const char *fp_fn, const char *int_fn) {
-    render_call(v, jitc_is_float(v) ? fp_fn : int_fn, 2);
 }
 
 /// True if `v` is double precision.
@@ -141,6 +137,18 @@ static void render_bitwise(Variable *v, const char *op) {
             from_bits_fn(v), v, to_bits_fn(v), a0, op, v, to_bits_fn(v), a1);
     else
         fmt("$t $v = $v $s $v;\n", v, v, a0, op, a1);
+}
+
+/// Declare `_a`: the address of element `index` of `ptr`, as a pointer to the
+/// binary view of `value`'s type.
+///
+/// The index is applied in ELEMENT units of the value type and only then
+/// reinterpreted. Casting the pointer first and indexing afterwards compiles
+/// and scales the index by the wrong element size -- silently, whenever the
+/// two widths happen to differ.
+static void render_atomic_addr(Variable *value, Variable *ptr, Variable *index) {
+    fmt("    $b *_a = ($b *) (($t *) $v + $v);\n", value, value, value, ptr,
+        index);
 }
 
 /// Emit a scatter-reduce (VarKind::Scatter with a non-Identity ReduceOp).
@@ -554,6 +562,133 @@ static void jitc_hip_render(Variable *v) {
                 put("{\n");
             render_scatter_reduce(op, ptr, value, index);
             put("}\n");
+            break;
+        }
+
+        // --- Atomics with a return value ---------------------------------------
+        //
+        // All three return the OLD value; getting that backwards is the easy
+        // mistake, and it is what spec_memory.hip pins down. Each declares its
+        // result BEFORE the mask test so that masked-off lanes still have a
+        // defined value -- the variable is referenced unconditionally further
+        // down the kernel.
+        //
+        // The CUDA and Metal backends warp-aggregate ScatterInc (one atomic per
+        // group of lanes hitting the same address, then a shuffle). That is a
+        // contention optimisation, not a semantic difference; a plain atomic
+        // per lane produces the same numbering. Deferred with ReduceMode::Local
+        // in render_scatter_reduce().
+        case VarKind::ScatterInc: {
+            Variable *ptr   = jitc_var(v->dep[0]),
+                     *index = jitc_var(v->dep[1]),
+                     *mask  = jitc_var(v->dep[2]);
+            bool unmasked = mask->is_literal() && mask->literal == 1;
+
+            fmt("$t $v = ($t) 0;\n", v, v, v);
+            if (!unmasked)
+                fmt("if ($v) {\n", mask);
+            else
+                put("{\n");
+            fmt("    $v = atomicAdd(($t *) $v + $v, ($t) 1);\n", v, v, ptr,
+                index, v);
+            put("}\n");
+            v->consumed = 1;
+            break;
+        }
+
+        case VarKind::ScatterExch: {
+            Variable *ptr   = jitc_var(v->dep[0]),
+                     *value = jitc_var(v->dep[1]),
+                     *index = jitc_var(v->dep[2]),
+                     *mask  = jitc_var(v->dep[3]);
+            bool unmasked = mask->is_literal() && mask->literal == 1;
+
+            fmt("$t $v = ($t) 0;\n", value, v, value);
+            if (!unmasked)
+                fmt("if ($v) {\n", mask);
+            else
+                put("{\n");
+
+            // Via the binary view: atomicExch has no 64-bit float overload.
+            // The reinterpretation is on the VALUE -- reinterpreting the
+            // pointer instead compiles and scales the index by the wrong
+            // element size (spec_memory.hip bit 18).
+            render_atomic_addr(value, ptr, index);
+            const char *to = to_bits_fn(value), *from = from_bits_fn(value);
+            if (to)
+                fmt("    $b _o = atomicExch(_a, ($b) $s($v));\n", value, value,
+                    to, value);
+            else
+                fmt("    $b _o = atomicExch(_a, ($b) $v);\n", value, value, value);
+            if (from)
+                fmt("    $v = $s(_o);\n", v, from);
+            else
+                fmt("    $v = ($t) _o;\n", v, value);
+
+            put("}\n");
+            v->consumed = 1;
+            break;
+        }
+
+        case VarKind::ScatterCAS: {
+            Variable *ptr     = jitc_var(v->dep[0]),
+                     *compare = jitc_var(v->dep[1]),
+                     *value   = jitc_var(v->dep[2]),
+                     *index   = jitc_var(v->dep[3]);
+
+            // The mask hangs off v->data here rather than a dep slot, all four
+            // of which are taken.
+            ScatterCASDData *cas_data = (ScatterCASDData *) v->data;
+            Variable *mask = jitc_var(cas_data->mask);
+            bool unmasked = mask->is_literal() && mask->literal == 1;
+
+            // Two outputs, read back by VarKind::Extract.
+            fmt("$t $v_out_0 = ($t) 0;\n"
+                "bool $v_out_1 = false;\n",
+                value, v, value, v);
+
+            if (!unmasked)
+                fmt("if ($v) {\n", mask);
+            else
+                put("{\n");
+
+            render_atomic_addr(value, ptr, index);
+            const char *to = to_bits_fn(value), *from = from_bits_fn(value);
+            if (to)
+                fmt("    $b _c = ($b) $s($v);\n"
+                    "    $b _o = atomicCAS(_a, _c, ($b) $s($v));\n",
+                    value, value, to, compare,
+                    value, value, to, value);
+            else
+                fmt("    $b _c = ($b) $v;\n"
+                    "    $b _o = atomicCAS(_a, _c, ($b) $v);\n",
+                    value, value, compare,
+                    value, value, value);
+
+            if (from)
+                fmt("    $v_out_0 = $s(_o);\n", v, from);
+            else
+                fmt("    $v_out_0 = ($t) _o;\n", v, value);
+
+            // "Did it swap" is old == expected. The return value alone does not
+            // say; a CAS that failed also returns something.
+            fmt("    $v_out_1 = (_o == _c);\n", v);
+            put("}\n");
+            v->consumed = 1;
+            break;
+        }
+
+        case VarKind::Extract: {
+            Variable *src = jitc_var(v->dep[0]);
+            uint32_t sub_index = (uint32_t) v->literal;
+
+            // ScatterCAS is the only multi-output op this backend emits so far;
+            // TraceRay / PacketGather / TexLookup land in the default case and
+            // say so explicitly rather than silently extracting field 0.
+            if ((VarKind) src->kind == VarKind::ScatterCAS)
+                fmt("$t $v = $v_out_$u;\n", v, v, src, sub_index);
+            else
+                fmt("$t $v = $v; // extract[$u]\n", v, v, src, sub_index);
             break;
         }
 

@@ -354,6 +354,32 @@ int main(int argc, char **argv) {
         test_metal &= (bool) jit_has_backend(JitBackend::Metal);
         test_hip &= (bool) jit_has_backend(JitBackend::HIP);
 
+        // Suites resting on backend subsystems the HIP port has not reached
+        // yet (PLAN.md §5). They are skipped rather than left to abort: a
+        // jitc_fail() takes down the whole binary at the first one, which
+        // hides every later test including the ones that do pass.
+        //
+        // The reason is PRINTED on every run rather than left in a comment, so
+        // the gap reads as a running list -- the same reason
+        // tools/hip_validate/run_tests.sh prints its "unverified on NVIDIA"
+        // list instead of describing it in prose. Delete an entry when the
+        // subsystem lands; the suite will then either pass or say what broke.
+        if (test_hip) {
+            static const struct { const char *suite, *reason; } hip_todo[] = {
+                { "array",  "VarKind::Array (local arrays)" },
+                { "record", "frozen-function recording (jit_freeze_start)" },
+                { "vcall",  "the call machinery (VarKind::Call)" }
+            };
+            for (const auto &e : hip_todo) {
+                if (strcmp(TEST_NAME, e.suite) == 0) {
+                    fprintf(stdout,
+                            "Skipping HIP in this suite: %s is not implemented "
+                            "for the HIP backend yet.\n", e.reason);
+                    test_hip = false;
+                }
+            }
+        }
+
 #if defined(DRJIT_ENABLE_OPTIX)
         test_optix &= (bool) jit_has_backend(JitBackend::CUDA);
 #else

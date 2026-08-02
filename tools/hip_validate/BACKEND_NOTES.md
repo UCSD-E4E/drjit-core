@@ -368,11 +368,15 @@ roughly 150 lines, so it belongs in the §9 patch inventory rather than in a
 that could NOT be kept out of upstream files. Everything else has stayed in new
 `hip_*` sources or behind a one-line guard.
 
-## 11e. Control flow is written but UNVERIFIED
+## 11e. Control flow — VERIFIED (this section is kept for the reasoning)
+
+**Resolved.** HIP is registered with the `TEST_*` macros and `test_loop` passes
+9/9. What follows is why the bespoke test was the wrong instinct, because the
+same temptation recurs for every subsystem still missing.
 
 `jitc_hip_render()` implements `LoopStart` / `LoopCond` / `LoopEnd` / `LoopPhi` /
 `LoopOutput` and `CondStart` / `CondMid` / `CondEnd`, ported closely from
-`metal_eval.cpp`. It compiles. **Nothing exercises it.**
+`metal_eval.cpp`.
 
 The subtle part is `LoopEnd`'s back edge. Copying `inner_out -> inner_in`
 naively is wrong when the two sets alias -- an earlier copy clobbers a value a
@@ -387,10 +391,51 @@ to be recorded a SECOND time after Dr.Jit simplifies the loop state. A test that
 gets that protocol subtly wrong fails for reasons unrelated to codegen, which is
 worse than no test: it points at the wrong suspect.
 
-**The right coverage is to register HIP with the `TEST_*` macros in
-`tests/test.h`**, so the existing `test_loop`, `test_vcall` and `test_basics`
-suites run against this backend. They already encode the protocol correctly and
-would cover far more than a bespoke test. Do that before trusting control flow.
+**The right coverage was to register HIP with the `TEST_*` macros in
+`tests/test.h`**, so the existing suites run against this backend. They already
+encode the protocol correctly and cover far more than a bespoke test would.
+
+## 11f. What the registered suites found
+
+Doing that turned up nine emitter bugs and six wiring bugs in an afternoon,
+none of which the specimens could have caught on their own — the specimens
+check that a *construct* works, the suites check that the emitter *chooses* it.
+Two are worth carrying forward as patterns rather than incidents:
+
+* **Two-bit backend fields.** HIP is backend 4, the first value needing a third
+  bit. `Variable::backend` and `AllocInfo` both truncated it, and neither
+  failed at the truncation — one surfaced as "the host backend is unavailable"
+  during codegen, the other as an out-of-memory two suites away. Any new packed
+  field must be added to `tests/hip_packing.cpp`.
+
+* **The shim is a CUDA ThreadState.** Every site that allocates, launches, or
+  **synchronises** has to treat a HIP backend as CUDA-backed; that is what
+  `jitc_is_cuda_backed()` is for. A missing sync site does not fail loudly, it
+  reads pinned memory before the copy into it lands — which looks exactly like
+  a wrong reduction result.
+
+### Current state per suite (CUDA shim)
+
+| suite | HIP |
+|---|---|
+| `test_basics` | 7/7 |
+| `test_loop` | 9/9 |
+| `test_mem` | 17/17 |
+| `test_reductions` | 14/14 |
+| `test_array` | skipped — `VarKind::Array` |
+| `test_record` | skipped — frozen-function recording |
+| `test_vcall` | skipped — call machinery |
+
+The three skips are listed in `tests/test.cpp` and PRINT their reason on every
+run. Delete an entry when the subsystem lands.
+
+### `test_graphviz` fails, and it is not ours
+
+It fails identically at the upstream merge-base (`7a9ab1f`) with HIP absent:
+the hardcoded reference string in `tests/graphviz.cpp` has drifted from the
+generator (font names, `dpi`, backend-name capitalisation, and variable
+ordering). Do not chase it as a regression; it needs an upstream fix or a
+regenerated reference.
 
 ## 12. Suggested implementation order
 
