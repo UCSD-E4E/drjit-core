@@ -186,6 +186,7 @@ if (DRJIT_ENABLE_HIP)
     src/hip_api.h
     src/hip_api.cpp
     src/hip_ts.h
+    src/hip_ts.cpp
     src/hip_core.cpp
     src/hip_prologue.h
     src/hip_literal.h

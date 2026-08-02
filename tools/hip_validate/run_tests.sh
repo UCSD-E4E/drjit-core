@@ -83,6 +83,20 @@ if [ -n "${HIPNV_CFLAGS:-}" ] && command -v nvcc >/dev/null 2>&1; then
     printf "  %-20s FAIL  (Phase 1 API surface broken)\n" "hipnv_pipeline"
     fail=$((fail+1))
   fi
+
+  # src/hip_ts.cpp cannot run here (hipInit fails without an AMD GPU), but the
+  # SHAPE of every call it makes can be: same sequences, real HIP headers,
+  # executed through HIP-on-CUDA. Catches swapped arguments, wrong flag values
+  # and element-vs-byte counts -- the mechanical port's failure modes.
+  SRC="$(dirname "$0")/hipnv_ts_calls.cpp"
+  if nvcc -x cu $HIPNV_CFLAGS -arch=sm_86 "$SRC" -o /tmp/hipnv_ts_calls $HIPNV_LDFLAGS >/dev/null 2>&1 &&
+     LD_LIBRARY_PATH="${CUDART_LIB}:${NVRTC_LIB}:$LD_LIBRARY_PATH" /tmp/hipnv_ts_calls >/dev/null 2>&1; then
+    printf "  %-20s PASS  (HIPThreadState call shapes)\n" "hipnv_ts_calls"
+    pass=$((pass+1))
+  else
+    printf "  %-20s FAIL  (HIPThreadState call shape wrong)\n" "hipnv_ts_calls"
+    fail=$((fail+1))
+  fi
 fi
 
 # --- HIP-RT traversal, actually executed (BACKEND_NOTES §7a) ----------------

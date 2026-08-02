@@ -928,6 +928,28 @@ struct ThreadStateBase {
     /// Maximum threads per threadgroup
     uint32_t metal_max_threads = 1024;
 #endif
+
+    /// ----------------------------- HIP-specific -----------------------------
+    //
+    // Opaque `void *`, like the Metal handles above and for the same reason:
+    // hipCtx_t / hipStream_t / hipEvent_t would drag hip_api.h into a header
+    // every translation unit includes. hip_ts.cpp casts them back.
+    //
+    // Separate from the CUDA fields even though they play the same roles --
+    // under DRJIT_HIP_CUDA_SHIM a HIPThreadState IS a CUDAThreadState and uses
+    // `stream`/`context` above, so sharing the storage would make it ambiguous
+    // which runtime owns the handle.
+
+#if defined(DRJIT_ENABLE_HIP)
+    /// hipCtx_t for this device
+    void *hip_context = nullptr;
+
+    /// hipStream_t that all work is ordered on
+    void *hip_stream = nullptr;
+
+    /// hipEvent_t used for cross-stream ordering
+    void *hip_event = nullptr;
+#endif
 };
 
 

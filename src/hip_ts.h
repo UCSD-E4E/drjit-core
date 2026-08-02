@@ -20,10 +20,16 @@
     separately -- it covers the real hipMalloc / hipModuleLaunchKernel surface
     that this deliberately bypasses (§3.5).
 
-    REAL (Phase 1). A standalone implementation over the HIP driver API,
-    structured as the mechanical cu* -> hip* port of cuda_ts.cpp that §4
-    anticipates. Not written yet; the API surface it will target is already
-    proven by tools/hip_validate/hipnv_pipeline.cpp.
+    REAL (Phase 1). A standalone implementation over the HIP runtime API, the
+    mechanical cu* -> hip* port of cuda_ts.cpp that §4 anticipates. The API
+    surface it targets is proven by tools/hip_validate/hipnv_pipeline.cpp, and
+    the exact call shapes it emits are checked by hipnv_ts_calls.cpp.
+
+    What it deliberately does NOT implement: block_reduce, block_prefix_reduce,
+    reduce_dot, compress, block_mkperm and aggregate. Those are not API calls,
+    they are LAUNCHES OF PRECOMPILED UTILITY KERNELS -- resources/kernels.cu
+    compiled to a gfx90a code object, which is Phase 3. Each raises with that
+    explanation rather than silently returning wrong data.
 */
 
 #pragma once
@@ -49,10 +55,58 @@ using HIPThreadState = CUDAThreadState;
 
 #else
 
-// Phase 1 lands the real implementation here. Declaring it rather than
-// defining it keeps the build honest -- enabling DRJIT_ENABLE_HIP without the
-// shim fails to link rather than silently doing something wrong.
-struct HIPThreadState;
+#include "hip_api.h"
+
+struct HIPThreadState final : ThreadState {
+    // --- Execution -----------------------------------------------------------
+
+    Task *launch(Kernel kernel, KernelKey &key, XXH128_hash_t hash,
+                 uint32_t size, std::vector<void *> &kernel_params,
+                 const std::vector<uint32_t> &kernel_param_ids,
+                 KernelHistoryEntry *kernel_history_entry) override;
+
+    // --- Memory --------------------------------------------------------------
+
+    void memset_async(void *ptr, uint32_t size, uint32_t isize,
+                      const void *src) override;
+    void memcpy(void *dst, const void *src, size_t size) override;
+    void memcpy_async(void *dst, const void *src, size_t size) override;
+    void poke(void *dst, const void *src, uint32_t size) override;
+
+    // --- Ordering ------------------------------------------------------------
+
+    void enqueue_host_func(void (*callback)(void *), void *payload) override;
+    void barrier() override;
+    void flush_deferred_free() override;
+
+    // --- Phase 3: these launch precompiled utility kernels ---------------------
+    //
+    // Not API calls -- they need resources/kernels.cu built as a gfx90a code
+    // object. Each raises rather than returning wrong data, and says which
+    // phase supplies it.
+
+    void aggregate(void *dst, AggregationEntry *agg, uint32_t size) override;
+    void block_reduce(VarType vt, ReduceOp op, uint32_t size,
+                      uint32_t block_size, const void *in, void *out) override;
+    void block_prefix_reduce(VarType vt, ReduceOp op, uint32_t size,
+                             uint32_t block_size, bool exclusive, bool reverse,
+                             const void *in, void *out) override;
+    void reduce_dot(VarType type, const void *ptr_1, const void *ptr_2,
+                    uint32_t size, void *out) override;
+    uint32_t compress(const uint8_t *in, uint32_t size, uint32_t *out) override;
+    uint32_t block_mkperm(const uint32_t *values, uint32_t size,
+                          uint32_t block_size, uint32_t bucket_count,
+                          uint32_t *perm, uint32_t *offsets) override;
+
+    // Not Phase 3 so much as not-on-the-path: matmul goes through rocBLAS and
+    // cooperative vectors are an OptiX/Metal feature with no HIP analogue yet.
+    // Both raise; neither is needed by any Mitsuba variant we target.
+    void batched_gemm(VarType type, bool At, bool Bt, uint32_t M, uint32_t N,
+                      uint32_t K, const GemmBatch *batch, const void *A,
+                      const void *B, void *C) override;
+    void coop_vec_pack(uint32_t count, const void *in, const MatrixDescr *in_d,
+                       void *out, const MatrixDescr *out_d) override;
+};
 
 #endif // DRJIT_HIP_CUDA_SHIM
 

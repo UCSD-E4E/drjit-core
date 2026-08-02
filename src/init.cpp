@@ -18,6 +18,20 @@
 #if defined(DRJIT_ENABLE_HIP)
 #  include "hip.h"
 #  include "hip_ts.h"
+#  if !defined(DRJIT_HIP_CUDA_SHIM)
+#    include "hip_api.h"
+
+/// Small helper so the HIP arm of jitc_init_thread_state() reports which call
+/// failed. Not hip_check(): that lives in hip_ts.cpp and jitc_fail()s, whereas
+/// a thread-state setup failure should raise and be catchable.
+static void hip_check_init(hipError_t rv, const char *what) {
+    if (rv != hipSuccess) {
+        const char *msg = hipGetErrorString ? hipGetErrorString(rv) : nullptr;
+        jitc_raise("jit_init_thread_state(): %s failed (%d%s%s).", what,
+                   (int) rv, msg ? ": " : "", msg ? msg : "");
+    }
+}
+#  endif
 #endif
 #include "llvm_ts.h"
 #include "malloc.h"
@@ -517,9 +531,27 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
         ts->event = hd.event;
         ts->sync_stream_event = hd.sync_stream_event;
 # else
-        jitc_raise("jit_init_thread_state(): the HIP backend has no runtime "
-                   "layer yet (Phase 1). Build with -DDRJIT_HIP_CUDA_SHIM=ON "
-                   "to run HIP codegen on a CUDA device.");
+        // Real path: one context and one stream per thread state, mirroring
+        // how the CUDA arm above binds the device's.
+        ts = new HIPThreadState();
+
+        HIPDevice &hd = state.hip_devices[0];
+        ts->device = hd.id;
+
+        hipCtx_t ctx = nullptr;
+        hip_check_init(hipCtxCreate(&ctx, 0, (hipDevice_t) hd.id),
+                       "hipCtxCreate");
+        ts->hip_context = ctx;
+
+        hipStream_t stream = nullptr;
+        hip_check_init(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+                       "hipStreamCreateWithFlags");
+        ts->hip_stream = stream;
+
+        hipEvent_t event = nullptr;
+        hip_check_init(hipEventCreateWithFlags(&event, hipEventDisableTiming),
+                       "hipEventCreateWithFlags");
+        ts->hip_event = event;
 # endif
         thread_state_hip = ts;
 #endif

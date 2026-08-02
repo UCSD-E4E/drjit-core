@@ -105,6 +105,26 @@ struct Kernel {
             bool has_call_table;
         } metal;
 #endif
+
+#if defined(DRJIT_ENABLE_HIP)
+        /// 5. HIP
+        ///
+        /// Structurally identical to the CUDA member, and deliberately NOT
+        /// aliased onto it: under DRJIT_HIP_CUDA_SHIM the HIP backend really is
+        /// driven by CUDAThreadState and stores CUmodule/CUfunction in
+        /// `kernel.cuda`, so sharing one member would make it impossible to
+        /// tell which runtime owns the handles.
+        struct {
+            /// Compiled hipModule_t
+            void *mod;
+
+            /// Main kernel entry point (hipFunction_t)
+            void *func;
+
+            /// Preferred block size to maximize occupancy
+            uint32_t block_size;
+        } hip;
+#endif
     };
 };
 
