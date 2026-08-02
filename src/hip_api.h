@@ -86,10 +86,12 @@ struct hipMemPool_st;  using hipMemPool_t  = hipMemPool_st *;
 #define hipHostMallocDefault                         0
 #define hipHostMallocPortable                        1
 
-#if defined(DRJIT_DYNAMIC_HIP)
+// Guarded, and NOT undef-ed at the end: hip_api.cpp defines this to emit
+// DEFINITIONS before including us. `#pragma once` means a second include
+// would be a no-op, so the .cpp must set it up front -- the same arrangement
+// cuda_api.{h,cpp} use.
+#if !defined(DR_HIP_SYM)
 #  define DR_HIP_SYM(x) extern x;
-#else
-#  define DR_HIP_SYM(x) x;
 #endif
 
 // ---------------------------------------------------------------------------
@@ -154,6 +156,5 @@ DR_HIP_SYM(hipError_t (*hipModuleOccupancyMaxPotentialBlockSize)(
 DR_HIP_SYM(hipError_t (*hipLaunchHostFunc)(hipStream_t, void (*)(void *),
                                            void *));
 
-#undef DR_HIP_SYM
 
 #endif // DRJIT_ENABLE_HIP

@@ -10,6 +10,14 @@
     but dlsym("hipInit") resolves the default version, so the plain names work.
 */
 
+// MUST precede the include: hip_api.h guards this definition, so setting it
+// here turns its declaration list into DEFINITIONS. `#pragma once` means a
+// second include would do nothing, which is why this cannot be done later --
+// cuda_api.cpp is arranged the same way.
+#if defined(DRJIT_DYNAMIC_HIP)
+#  define DR_HIP_SYM(...) __VA_ARGS__ = nullptr;
+#endif
+
 #include "hip_api.h"
 #include "log.h"
 #include "internal.h"
@@ -23,9 +31,6 @@
 #  else
 #    include <windows.h>
 #  endif
-
-#  define DR_HIP_SYM(...) __VA_ARGS__ = nullptr;
-#  include "hip_api.h"
 
 static void *jitc_hip_handle = nullptr;
 
@@ -134,8 +139,25 @@ void jitc_hip_api_shutdown() {
     if (!jitc_hip_handle)
         return;
 
-    #define DR_HIP_SYM(...) __VA_ARGS__ = nullptr;
-    #include "hip_api.h"
+    // Listed explicitly rather than re-including the header, which `#pragma
+    // once` would make a no-op. Same as jitc_cuda_api_shutdown().
+    #define Z(x) x = nullptr
+    Z(hipInit); Z(hipGetDeviceCount); Z(hipDeviceGet);
+    Z(hipDeviceGetAttribute); Z(hipDeviceGetName); Z(hipDeviceTotalMem);
+    Z(hipDeviceGetPCIBusId); Z(hipGetErrorString);
+    Z(hipCtxCreate); Z(hipCtxDestroy); Z(hipCtxSetCurrent);
+    Z(hipCtxPushCurrent); Z(hipCtxPopCurrent); Z(hipCtxSynchronize);
+    Z(hipStreamCreateWithFlags); Z(hipStreamDestroy);
+    Z(hipStreamSynchronize); Z(hipStreamWaitEvent);
+    Z(hipEventCreateWithFlags); Z(hipEventDestroy); Z(hipEventRecord);
+    Z(hipMalloc); Z(hipFree); Z(hipMallocAsync); Z(hipFreeAsync);
+    Z(hipHostMalloc); Z(hipHostFree); Z(hipMemGetInfo);
+    Z(hipMemcpyAsync); Z(hipMemsetD8Async); Z(hipMemsetD16Async);
+    Z(hipMemsetD32Async);
+    Z(hipModuleLoadData); Z(hipModuleUnload); Z(hipModuleGetFunction);
+    Z(hipModuleLaunchKernel); Z(hipModuleOccupancyMaxPotentialBlockSize);
+    Z(hipLaunchHostFunc);
+    #undef Z
 
 #  if !defined(_WIN32)
     if (jitc_hip_handle != RTLD_NEXT)
