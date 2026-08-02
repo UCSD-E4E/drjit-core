@@ -147,6 +147,65 @@ static bool run_gfx_arm(const Options &o, const std::string &kernel_src) {
     std::string cmd = hipcc + " --offload-arch=" + o.arch + " --genco ";
     if (!devlib.empty())
         cmd += "--rocm-device-lib-path=" + devlib + " ";
+
+    // --- HIP-RT ------------------------------------------------------------
+    //
+    // A kernel that traverses needs the HIP-RT headers AND its device library,
+    // which ships as a COMPRESSED OFFLOAD BUNDLE (magic "CCOB"), not raw
+    // bitcode -- passing the .bc straight to clang fails with "file doesn't
+    // start with bitcode header". It has to be unbundled for the target arch
+    // first, which is also the only way to confirm the arch is in there.
+    //
+    // Auto-detected from the source so kernels stay plain files with no
+    // per-kernel configuration.
+    bool needs_hiprt = kernel_src.find("hiprt") != std::string::npos;
+    std::string hiprt = env_or("HIPRT_PATH", "");
+    if (needs_hiprt) {
+        if (hiprt.empty()) {
+            printf("  [gfx ] SKIP  kernel uses HIP-RT but $HIPRT_PATH is unset\n");
+            return false;
+        }
+
+        std::string bundler = env_or("HIP_BUNDLER", "");
+        if (bundler.empty()) {
+            printf("  [gfx ] SKIP  kernel uses HIP-RT but $HIP_BUNDLER is unset "
+                   "(needed to unbundle the device library)\n");
+            return false;
+        }
+
+        // The library name carries the HIP-RT and ROCm versions, so glob for it
+        // rather than pinning a version this tool would then have to track.
+        std::string bc = "/tmp/hip_validate_hiprt_" + o.arch + ".bc";
+        std::string find = "ls " + hiprt + "/lib/hiprt*_amd_lib_linux.bc 2>/dev/null | head -1";
+        std::string lib;
+        if (FILE *fp = popen(find.c_str(), "r")) {
+            char lb[512];
+            if (fgets(lb, sizeof(lb), fp)) {
+                lib = lb;
+                while (!lib.empty() && (lib.back() == '\n' || lib.back() == ' '))
+                    lib.pop_back();
+            }
+            pclose(fp);
+        }
+        if (lib.empty()) {
+            printf("  [gfx ] SKIP  no hiprt*_amd_lib_linux.bc under %s/lib\n",
+                   hiprt.c_str());
+            return false;
+        }
+
+        std::string uc = bundler + " --type=bc --unbundle --input=" + lib +
+                         " --output=" + bc + " --targets=hip-amdgcn-amd-amdhsa--" +
+                         o.arch + " 2>&1";
+        if (system(uc.c_str()) != 0) {
+            printf("  [gfx ] FAIL  HIP-RT device library has no %s slice\n",
+                   o.arch.c_str());
+            return false;
+        }
+
+        cmd += "-I" + hiprt + "/include ";
+        cmd += "-Xclang -mlink-bitcode-file -Xclang " + bc + " ";
+    }
+
     cmd += tmp_src + " -o " + tmp_out + " 2>&1";
 
     auto t0 = std::chrono::steady_clock::now();
@@ -192,6 +251,42 @@ static bool run_gfx_arm(const Options &o, const std::string &kernel_src) {
     printf("  [gfx ] %s  %s, %zu bytes, %.0f ms%s\n",
            tagged ? "PASS" : "FAIL",
            o.arch.c_str(), co.size(), ms, tag_note);
+
+    // Register and scratch usage, read out of the code object's symbol table.
+    //
+    // Reported for every kernel because it is the only occupancy signal
+    // available without the card, and the numbers are otherwise invisible: a
+    // change that doubles scratch still compiles, still runs on the shim (which
+    // has entirely different register pressure), and shows up as halved
+    // throughput on the MI210 months later. It matters most for traversal --
+    // HIP-RT keeps its stack in scratch.
+    if (!bundler.empty()) {
+        std::string elf = "/tmp/hip_validate_gfx_res.elf";
+        std::string uc = bundler + " --type=o --unbundle --input=" + tmp_out +
+                         " --output=" + elf + " --targets=hipv4-amdgcn-amd-amdhsa--" +
+                         o.arch + " 2>/dev/null";
+        if (system(uc.c_str()) == 0) {
+            std::string objdump = env_or("HIP_OBJDUMP", "llvm-objdump");
+            std::string sc = objdump + " -t " + elf +
+                             " 2>/dev/null | grep -E '\\.(num_vgpr|num_agpr|"
+                             "numbered_sgpr|private_seg_size)$'";
+            if (FILE *sp = popen(sc.c_str(), "r")) {
+                unsigned long vgpr = 0, agpr = 0, sgpr = 0, scratch = 0;
+                char lb[512];
+                while (fgets(lb, sizeof(lb), sp)) {
+                    unsigned long val = strtoul(lb, nullptr, 16);
+                    if (strstr(lb, ".num_vgpr"))            vgpr = val;
+                    else if (strstr(lb, ".num_agpr"))       agpr = val;
+                    else if (strstr(lb, ".numbered_sgpr"))  sgpr = val;
+                    else if (strstr(lb, ".private_seg_size")) scratch = val;
+                }
+                pclose(sp);
+                if (vgpr || sgpr || scratch)
+                    printf("         %lu VGPR, %lu AGPR, %lu SGPR, %lu B scratch\n",
+                           vgpr, agpr, sgpr, scratch);
+            }
+        }
+    }
 
     if (o.dump_isa) {
         // Must unbundle first -- llvm-objdump cannot read an offload bundle.

@@ -155,6 +155,57 @@ signature and should become `jit_hip_ray_trace` verbatim.
 Contrast with OptiX, whose `_optix_hitobject_traverse` call takes ~50 arguments
 (§0.2). Mirroring Metal here avoids roughly an order of magnitude of interface.
 
+### 7a. Phase 0b spike results — measured, not assumed
+
+`spec_trace.hip` compiles and **links** a real HIP-RT scene traversal for
+gfx90a. Five findings, three of which change the plan.
+
+**1. The device library is a compressed offload bundle, not bitcode.**
+`hiprt*_amd_lib_linux.bc` starts with the magic `CCOB`. Handing it to clang
+fails with *"file doesn't start with bitcode header"*. It must be unbundled per
+target with `clang-offload-bundler --type=bc --unbundle`, which is also the
+only way to confirm a given arch is present. `hip_validate` now does this
+automatically for any kernel mentioning `hiprt`.
+
+**2. `gfx90a` really is in the bundle, and the traversal links.** This upgrades
+§0.2's "HIP-RT supports gfx90a" from a support-matrix claim to a linked code
+object. The build line that works:
+
+```
+hipcc --offload-arch=gfx90a --genco --rocm-device-lib-path=$HIP_DEVICE_LIB_PATH \
+      -I$HIPRT_PATH/include \
+      -Xclang -mlink-bitcode-file -Xclang <unbundled-gfx90a>.bc  kernel.hip
+```
+
+**3. Every traversing kernel MUST define `intersectFunc` and `filterFunc`.**
+HIP-RT declares them and leaves the definitions to the application — the custom
+-primitive intersection and any-hit filter hooks, analogous to Metal's
+intersection function table and OptiX's IS/AH programs. Omit them and the link
+fails with `undefined hidden symbol: intersectFunc(...)`. **The emitter must
+emit at least stubs into every kernel that traverses**, and dispatch through
+them for scenes with custom primitives. Nothing in §7 anticipated this.
+
+**4. `hiprtHit` does not carry a geometry ID or a user instance ID.** It has
+`hasHit()`, `t`, `uv.x`, `uv.y`, `primID`, `instanceID` — six of Metal's eight
+outputs. `geometry_id` and `user_instance_id` have to be reconstructed
+application-side (an indexed table, most likely). This is a **contract
+difference**, so §7's "adopt `jit_metal_ray_trace`'s signature verbatim" needs
+qualifying before the interface is fixed.
+
+**5. Traversal costs 64 VGPR / 38 AGPR / 54 SGPR / 800 B scratch** on gfx90a
+for a minimal closest-hit scene traversal. HIP-RT keeps its stack in scratch,
+so this is the number to watch: a shape change that doubles it still compiles,
+still runs identically on the shim (different register file entirely), and
+surfaces as halved MI210 throughput much later. `hip_validate` now prints
+register and scratch usage for **every** kernel for this reason.
+
+**Still unverifiable without an MI210:** whether traversal returns correct
+hits, and the whole host-side API (context creation, geometry build). The
+packaged HIP-RT ships AMD-only device libraries and its host library dlopens
+`libamdhip64` with no CUDA paths, so despite the `hiprtDeviceNVIDIA` enum there
+is no NVIDIA arm to run. `run_tests.sh` prints this as a separate, stronger
+caveat than the wave64 list.
+
 ---
 
 ## 8. Scene discovery happens *during* codegen

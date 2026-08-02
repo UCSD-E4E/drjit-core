@@ -30,6 +30,15 @@ for k in "$DIR"/*.hip; do
   extra=""
   case "$name" in spec_*) extra="--expect-zero" ;; esac
 
+  # HIP-RT kernels are gfx-only. The packaged HIP-RT has device libraries for
+  # AMD targets alone and its host library dlopens libamdhip64 with no CUDA
+  # paths, so there is nothing for the execution arm to run -- this is a
+  # property of the library, not a gap in the harness. Compiling and LINKING
+  # for gfx90a is still the bulk of the risk (see spec_trace.hip).
+  if grep -q "hiprt" "$k" 2>/dev/null; then
+    extra="--no-exec"
+  fi
+
   if "$BIN" $extra "$k" >/dev/null 2>&1; then rc=0; else rc=1; fi
 
   if [ "$rc" -eq "$expect_fail" ]; then
@@ -93,8 +102,24 @@ if [ -n "$unver" ]; then
   echo "  UNVERIFIED ON NVIDIA (re-run these first on the MI210):"
   for u in $unver; do echo "    - $u"; done
   echo "    reason: exec arm is warp-32 and aliases DRJIT_HALF to float"
-  echo
 fi
+
+# HIP-RT kernels never ran at all -- a stronger caveat than the wave64 list,
+# and worth stating separately so the two are not conflated.
+rt=""
+for k in "$DIR"/*.hip; do
+  if grep -q "hiprt" "$k" 2>/dev/null; then
+    rt="$rt $(basename "$k" .hip)"
+  fi
+done
+if [ -n "$rt" ]; then
+  echo
+  echo "  NEVER EXECUTED (compiled and linked for gfx90a only):"
+  for u in $rt; do echo "    - $u"; done
+  echo "    reason: packaged HIP-RT is AMD-only; there is no NVIDIA arm to run."
+  echo "    Hit correctness is unverified until an MI210 is present."
+fi
+echo
 
 echo "  ---- $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
