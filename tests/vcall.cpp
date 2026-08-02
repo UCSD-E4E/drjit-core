@@ -152,6 +152,8 @@ const char *backend_name(JitBackend backend) {
             return "LLVM";
         case JitBackend::Metal:
             return "Metal";
+        case JitBackend::HIP:
+            return "HIP";
         case JitBackend::None:
             return "None";
         default:
@@ -1348,6 +1350,16 @@ TEST_ALL(13_load_bool_data) {
  * nanobind::intrusive_base class.
  */
 TEST_ALL(14_frozen_vcall) {
+    // The only test in this suite that is not about the call machinery: it
+    // wraps one in a FrozenFunction, so it needs the recording thread state.
+    // HIP implements calls but not recording yet, and jit_freeze_start() has
+    // no HIP arm -- see the per-suite list in tests/test.cpp, which skips
+    // test_record wholesale for the same reason. Returning here keeps the
+    // other 13 vcall tests running against HIP instead of losing the suite to
+    // an unrelated gap.
+    if constexpr (Backend == JitBackend::HIP)
+        return;
+
     jit_set_flag(JitFlag::VCallOptimize, true);
     jit_set_flag(JitFlag::SymbolicCalls, true);
 

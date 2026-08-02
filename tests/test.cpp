@@ -367,8 +367,7 @@ int main(int argc, char **argv) {
         if (test_hip) {
             static const struct { const char *suite, *reason; } hip_todo[] = {
                 { "array",  "VarKind::Array (local arrays)" },
-                { "record", "frozen-function recording (jit_freeze_start)" },
-                { "vcall",  "the call machinery (VarKind::Call)" }
+                { "record", "frozen-function recording (jit_freeze_start)" }
             };
             for (const auto &e : hip_todo) {
                 if (strcmp(TEST_NAME, e.suite) == 0) {

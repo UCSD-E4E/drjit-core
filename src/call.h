@@ -291,6 +291,12 @@ extern void jitc_var_call_assemble_metal(CallData *call, uint32_t call_reg,
                                          uint32_t in_size, uint32_t in_align,
                                          uint32_t out_size, uint32_t out_align);
 
+/// HIP takes no size/alignment arguments: outputs are returned in a by-value
+/// struct and inputs are by-value parameters, so there is no auxiliary buffer
+/// to lay out (BACKEND_NOTES §9a).
+extern void jitc_var_call_assemble_hip(CallData *call, uint32_t call_reg,
+                                       uint32_t self_reg, uint32_t mask_reg);
+
 extern void jitc_var_call(const char *domain, bool symbolic, uint32_t self,
                           uint32_t mask, uint32_t n_inst, uint32_t max_inst_id,
                           const uint32_t *inst_id, uint32_t n_in,
@@ -314,3 +320,5 @@ extern void jitc_var_call_getter_assemble_llvm(Variable *v, const Variable *inde
                                                const Variable *mask);
 extern void jitc_var_call_getter_assemble_metal(Variable *v, const Variable *index,
                                                 const Variable *mask);
+extern void jitc_var_call_getter_assemble_hip(Variable *v, const Variable *index,
+                                              const Variable *mask);

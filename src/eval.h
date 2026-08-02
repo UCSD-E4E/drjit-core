@@ -177,6 +177,12 @@ extern int metal_vft_arg_index;
 extern void jitc_hip_assemble(ThreadState *ts, ScheduledGroup group,
                               uint32_t n_regs, uint32_t n_params);
 
+/// Used by jitc_call() to generate HIP C++ source for callables. Takes no
+/// size/alignment arguments: outputs come back in a by-value struct and inputs
+/// are by-value parameters, so there is no auxiliary buffer to lay out
+/// (BACKEND_NOTES §9a).
+extern void jitc_hip_assemble_func(const CallData *call, uint32_t inst);
+
 /// Reset per-kernel HIP assembly state at the start of jitc_eval()
 extern void jitc_hip_assemble_reset();
 

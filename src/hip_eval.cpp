@@ -25,7 +25,7 @@
 #include "var.h"
 #include "log.h"
 #include "strbuf.h"
-#include "call.h"        // jitc_call_upload
+#include "call.h"      // CallData, GetterData, jitc_call_upload, slot helpers
 #include "loop.h"        // LoopData
 #include "cond.h"        // CondData, jitc_cond_output_active
 #include "op.h"          // ScatterCASDData
@@ -832,12 +832,407 @@ static void jitc_hip_render(Variable *v) {
         case VarKind::CondOutput:
             break;
 
+        // --- Dynamic dispatch ---------------------------------------------------
+        case VarKind::Call: {
+            Variable *a0 = jitc_var(v->dep[0]),
+                     *a1 = jitc_var(v->dep[1]);
+            jitc_var_call_assemble((CallData *) v->data, v->reg_index,
+                                   a0->reg_index, a1->reg_index);
+            break;
+        }
+
+        case VarKind::CallGetter: {
+            Variable *index = jitc_var(v->dep[0]),
+                     *mask  = jitc_var(v->dep[1]);
+            jitc_var_call_getter_assemble(v, index, mask);
+            break;
+        }
+
+        // Both are declared by the dispatch/callable machinery rather than
+        // here: CallInput becomes a by-value parameter inside the callable and
+        // needs nothing at the call site, and CallOutput is unpacked from the
+        // return struct by jitc_var_call_assemble_hip().
+        case VarKind::CallInput:
+        case VarKind::CallOutput:
+            break;
+
+        case VarKind::CallSelf:
+            fmt("u32 $v = self;\n", v);
+            break;
+
         default:
             jitc_fail("jitc_hip_render(): unhandled variable kind \"%s\"! The "
                       "source this opcode must produce is specified in "
                       "tools/hip_validate/kernels/spec_*.hip.",
                       var_kind_name[(uint32_t) v->kind]);
     }
+}
+
+// ---------------------------------------------------------------------------
+//  Dynamic dispatch (vcalls)
+// ---------------------------------------------------------------------------
+//
+// The dispatch SHAPE is a `switch`, not a function table, and that is a
+// measured choice rather than a stylistic one -- see BACKEND_NOTES §9a and
+// tools/hip_validate/kernels/spec_call.hip, which tested all three candidates
+// on gfx90a and on NVRTC. The single-table-with-casts form that CUDA and Metal
+// use is rejected by NVRTC ("dynamic initialization is not supported for a
+// __device__ variable"), and NVRTC is the shim's compiler -- so that shape
+// could be compiled for the target but never executed anywhere we have.
+//
+// Two consequences worth stating plainly:
+//
+//   * The switch keys on `self` (the instance ID), not on the callable index.
+//     Instance IDs are known at emission time; the callable index is assigned
+//     later, in a pass over globals_map that has not run yet when the dispatch
+//     site is written. Instances sharing a callable share a case BODY -- their
+//     labels fall through to one call -- so code size still scales with unique
+//     callables, not with instances.
+//
+//   * The offset table's low half (the callable index) is therefore unused by
+//     HIP. Only the high half, the instance's data offset, is read.
+
+/// Does this call have any live outputs?
+static bool jitc_hip_call_has_out(const CallData *call) {
+    for (uint32_t i = 0; i < call->n_out; ++i) {
+        if (call->out_offset[i] == (uint32_t) -1)
+            continue;
+        Variable *v = jitc_var(call->outer_out[i]);
+        if (v && v->reg_index && v->param_type != ParamType::Input)
+            return true;
+    }
+    return false;
+}
+
+/// Name of the by-value return struct: `Ret_` + the mangled active output
+/// types. Keyed by content so two calls with the same output signature share
+/// one definition.
+static void jitc_hip_put_ret_type(const CallData *call) {
+    put("Ret_");
+    for (uint32_t i = 0; i < call->n_out; ++i)
+        if (call->out_offset[i] != (uint32_t) -1)
+            put(type_mangle[jitc_var(call->inner_out[i])->type]);
+}
+
+/// Register the return struct definition as a global, so it precedes both the
+/// callables and the kernel. Registration dedups by content.
+static void jitc_hip_emit_ret_struct(const CallData *call) {
+    if (!jitc_hip_call_has_out(call))
+        return;
+    size_t off = buffer.size();
+    put("struct ");
+    jitc_hip_put_ret_type(call);
+    put(" {\n");
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < call->n_out; ++i) {
+        if (call->out_offset[i] == (uint32_t) -1)
+            continue;
+        fmt("$t r$u;\n", jitc_var(call->inner_out[i]), k);
+        k++;
+    }
+    put("};");
+    jitc_register_global(buffer.get() + off);
+    buffer.rewind_to(off);
+}
+
+/// The typed parameter list shared by a callable's definition and its forward
+/// declaration: a fixed prefix (index, self, data), then the call-data base
+/// pointer if this callable contains a nested call, then one by-value
+/// parameter per live input.
+///
+/// Metal also threads a `call_table` handle through every callable. HIP does
+/// not need one -- the switch names its targets directly -- so that parameter
+/// is absent, and nested dispatch reaches its targets the same way.
+static void jitc_hip_callable_signature(const CallData *call, bool with_names) {
+    if (with_names)
+        put("u32 index, u32 self, const u8 *data");
+    else
+        put("u32, u32, const u8 *");
+
+    if (call->use_nested) {
+        if (with_names)
+            put(", const u8 *base");
+        else
+            put(", const u8 *");
+    }
+
+    for (uint32_t i = 0; i < call->n_in; ++i) {
+        if (!call->in_active[i])
+            continue;
+        Variable *vo = jitc_var(call->outer_in[i]);
+        if (with_names)
+            fmt(", $t a$u", vo, i);
+        else
+            fmt(", $t", vo);
+    }
+}
+
+/// Emit one callable body (`func_<hash>`), i.e. one instance's version of the
+/// call. Invoked from jitc_assemble_func() once per instance.
+void jitc_hip_assemble_func(const CallData *call, uint32_t inst) {
+    jitc_hip_emit_ret_struct(call);
+
+    // __device__, not __global__: these are ordinary functions called from the
+    // kernel, and `static` would let the compiler drop the ones only reached
+    // through a switch arm it cannot see through.
+    put("__device__ ");
+    if (jitc_hip_call_has_out(call))
+        jitc_hip_put_ret_type(call);
+    else
+        put("void");
+    put(" func_^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^(");
+    jitc_hip_callable_signature(call, /*with_names=*/true);
+    put(") {\n");
+    fmt("// Call: $s\n", call->name.c_str());
+
+    // Bind this instance's capture slots so jitc_call_slot_rel_offset()
+    // resolves them in O(1) below.
+    jitc_call_bind_slots(call, inst);
+
+    for (size_t i = 0; i < schedule.size(); ++i) {
+        ScheduledVariable &sv = schedule[i];
+        Variable *v = jitc_var(sv.index);
+        VarType vt = (VarType) v->type;
+        VarKind kind = (VarKind) v->kind;
+
+        if (kind == VarKind::Counter) {
+            // Inside a callable the kernel's `r0` is out of scope; the thread
+            // index arrives as the `index` parameter.
+            fmt("$t $v = ($t) index;\n", v, v, v);
+        } else if (kind == VarKind::CallInput) {
+            // Read the by-value parameter named after this input's index.
+            uint32_t in_i = 0;
+            for (; in_i < call->n_in; ++in_i)
+                if (call->inner_in[in_i] == sv.index)
+                    break;
+            fmt("$t $v = a$u;\n", v, v, in_i);
+        } else if (kind == VarKind::CallSelf) {
+            fmt("u32 $v = self;\n", v);
+        } else if (v->is_evaluated() ||
+                   (vt == VarType::Pointer && kind == VarKind::Literal)) {
+            // A captured field, read out of this instance's call-data block.
+            //
+            // Metal coalesces the packet-loadable prefix into uint4 loads.
+            // Deliberately not done here: it is a bandwidth optimisation whose
+            // payoff is unmeasured on CDNA2, and getting the word-extraction
+            // arithmetic subtly wrong yields plausible garbage rather than a
+            // failure. Plain typed loads first, coalescing when there is a
+            // profile to justify it.
+            uint32_t offset = jitc_call_slot_rel_offset(call, inst, v, sv.index);
+
+            if (vt == VarType::Bool)
+                fmt("bool $v = *(const u8 *)(data + $u) != 0;\n", v, offset);
+            else if (vt == VarType::Pointer)
+                fmt("const u8 *$v = *(const u8 *const *)(data + $u);\n",
+                    v, offset);
+            else
+                fmt("$t $v = *(const $t *)(data + $u);\n", v, v, v, offset);
+        } else {
+            jitc_hip_render(v);
+        }
+    }
+
+    // Pack the live outputs into the return struct and return it by value.
+    if (jitc_hip_call_has_out(call)) {
+        put("    ");
+        jitc_hip_put_ret_type(call);
+        put(" ret;\n");
+        uint32_t k = 0;
+        for (uint32_t i = 0; i < call->n_out; ++i) {
+            if (call->out_offset[i] == (uint32_t) -1)
+                continue;
+            const Variable *v =
+                jitc_var(call->inner_out[inst * call->n_out + i]);
+            fmt("ret.r$u = $v;\n", k, v);
+            k++;
+        }
+        put("return ret;\n");
+    }
+
+    put("}\n");
+}
+
+/// Getter: read one field straight out of the instance's call data, skipping
+/// dispatch entirely. Mirrors the masked Gather, sourced from
+/// `base + header_offset`.
+void jitc_var_call_getter_assemble_hip(Variable *v, const Variable *index,
+                                       const Variable *mask) {
+    GetterData *gd = (GetterData *) v->data;
+    uint32_t header_offset = gd->header_offset;
+
+    // The kernel binds the call-data base to a register; inside a callable it
+    // arrives as the `base` parameter.
+    char base[32];
+    if (callable_depth == 0)
+        snprintf(base, sizeof(base), "r%u", call_buffer.base_reg);
+    else
+        snprintf(base, sizeof(base), "base");
+
+    bool is_unmasked = mask->is_literal() && mask->literal == 1;
+    if (is_unmasked)
+        fmt("$t $v = ((const $t *) ($s + $u))[$v];\n",
+            v, v, v, base, header_offset, index);
+    else
+        fmt("$t $v = ($v) ? ((const $t *) ($s + $u))[$v] : ($t) 0;\n",
+            v, v, mask, v, base, header_offset, index, v);
+}
+
+/// Emit the dispatch site.
+void jitc_var_call_assemble_hip(CallData *call, uint32_t call_reg,
+                                uint32_t self_reg, uint32_t mask_reg) {
+    Variable *mask = jitc_var(jitc_var(call->id)->dep[1]);
+    bool is_masked = !mask->is_literal() || mask->literal != 1;
+    bool has_out = jitc_hip_call_has_out(call);
+
+    fmt("\n// VCall: $s\n", call->name.c_str());
+
+    // The outputs the kernel actually consumes, paired with their field index
+    // in the return struct (`r<k>`, k running over ALL active outputs so it
+    // matches jitc_hip_emit_ret_struct).
+    std::vector<std::pair<Variable *, uint32_t>> out_regs;
+    out_regs.reserve(call->n_out);
+    for (uint32_t i = 0, k = 0; i < call->n_out; ++i) {
+        if (call->out_offset[i] == (uint32_t) -1)
+            continue;
+        Variable *v = jitc_var(call->outer_out[i]);
+        if (v && v->reg_index && v->param_type != ParamType::Input)
+            out_regs.emplace_back(v, k);
+        k++;
+    }
+
+    // Declared before the guard, uninitialized: the call assigns them, and the
+    // `else` branch zeroes them. Lanes that did not call still read these
+    // further down the kernel, and an undefined register there is a wrong
+    // pixel rather than a crash (spec_call.hip bit 5).
+    for (auto [v, field] : out_regs)
+        fmt("$t $v;\n", v, v);
+
+    if (is_masked)
+        fmt("if (r$u) {\n", mask_reg);
+    else
+        put("{\n");
+
+    char base[32];
+    if (callable_depth == 0)
+        snprintf(base, sizeof(base), "r%u", call_buffer.base_reg);
+    else
+        snprintf(base, sizeof(base), "base");
+
+    bool has_slots = !call->slots.empty();
+
+    // The offset-table entry for this instance: (data_offset << 32) | index.
+    // Only the high half is used -- see the note at the top of this section.
+    if (has_slots) {
+        fmt("u64 _oe_$u = ((const u64 *) $s)[$u + r$u];\n",
+            call_reg, base,
+            call->offset_base / (uint32_t) sizeof(uint64_t), self_reg);
+        fmt("const u8 *_cd_$u = (const u8 *) $s + (u32) (_oe_$u >> 32);\n",
+            call_reg, base, call_reg);
+    }
+
+    // Inside a callable the kernel-level `r0` is out of scope; the enclosing
+    // callable received the thread index as `index`.
+    const char *index_name = (callable_depth > 0) ? "index" : "r0";
+
+    auto put_args = [&]() {
+        fmt("$s, r$u, ", index_name, self_reg);
+        if (has_slots)
+            fmt("_cd_$u", call_reg);
+        else
+            put("(const u8 *) nullptr");
+        if (call->use_nested)
+            fmt(", $s", base);
+        // Live inputs always have a register: in_active mirrors the packing
+        // predicate, which excludes inputs without one.
+        for (uint32_t i = 0; i < call->n_in; ++i)
+            if (call->in_active[i])
+                fmt(", r$u", jitc_var(call->outer_in[i])->reg_index);
+    };
+
+    if (has_out) {
+        put("    ");
+        jitc_hip_put_ret_type(call);
+        fmt(" ret_$u;\n", call_reg);
+    }
+
+    if (call->n_inst == 1) {
+        // A single target needs no dispatch at all: call it by name and let
+        // the compiler inline it.
+        if (has_out)
+            fmt("    ret_$u = ", call_reg);
+        else
+            put("    ");
+        put("func_");
+        buffer.put_q64_unchecked(call->inst_hash[0].high64);
+        buffer.put_q64_unchecked(call->inst_hash[0].low64);
+        put("(");
+        put_args();
+        put(");\n");
+    } else {
+        // Group instances by callable, so instances sharing an implementation
+        // share ONE call body and contribute only a case label each. Without
+        // this the emitted code would scale with the instance count, which for
+        // a Mitsuba scene is far larger than the number of BSDF types.
+        std::vector<std::pair<XXH128_hash_t, std::vector<uint32_t>>> groups;
+        for (uint32_t i = 0; i < call->n_inst; ++i) {
+            XXH128_hash_t h = call->inst_hash[i];
+            auto it = groups.end();
+            for (auto g = groups.begin(); g != groups.end(); ++g) {
+                if (g->first.low64 == h.low64 && g->first.high64 == h.high64) {
+                    it = g;
+                    break;
+                }
+            }
+            if (it == groups.end()) {
+                groups.emplace_back(h, std::vector<uint32_t>{ call->inst_id[i] });
+            } else {
+                it->second.push_back(call->inst_id[i]);
+            }
+        }
+
+        fmt("    switch (r$u) {\n", self_reg);
+        for (auto &[hash, ids] : groups) {
+            for (uint32_t id : ids)
+                fmt("        case $u:\n", id);
+            put("            ");
+            if (has_out)
+                fmt("ret_$u = ", call_reg);
+            put("func_");
+            buffer.put_q64_unchecked(hash.high64);
+            buffer.put_q64_unchecked(hash.low64);
+            put("(");
+            put_args();
+            put(");\n            break;\n");
+        }
+        // Not dead code: `self` is data. An instance ID outside this call
+        // site's set must produce something defined rather than falling
+        // through to whatever the next statement happens to be.
+        if (has_out) {
+            put("        default:\n");
+            uint32_t k = 0;
+            for (uint32_t i = 0; i < call->n_out; ++i) {
+                if (call->out_offset[i] == (uint32_t) -1)
+                    continue;
+                fmt("            ret_$u.r$u = ($t) 0;\n", call_reg, k,
+                    jitc_var(call->inner_out[i]));
+                k++;
+            }
+            put("            break;\n");
+        } else {
+            put("        default: break;\n");
+        }
+        put("    }\n");
+    }
+
+    for (auto [v, field] : out_regs)
+        fmt("$v = ret_$u.r$u;\n", v, call_reg, field);
+
+    if (is_masked && !out_regs.empty()) {
+        put("} else {\n");
+        for (auto [v, field] : out_regs)
+            fmt("$v = ($t) 0;\n", v, v);
+    }
+    put("}\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1255,13 @@ void jitc_hip_assemble(ThreadState *ts, ScheduledGroup group,
         std::string prologue = jitc_hip_kernel_prologue(n_params);
         put(prologue.c_str(), prologue.size());
     }
+
+    // Bind the call-data base pointer once; every dispatch and getter in this
+    // kernel indexes off it. The args index is the parameter index minus one
+    // (args[] excludes the leading `size` field -- the `$o` convention).
+    if (call_buffer.base_v)
+        fmt("const u8 *r$u = (const u8 *) params.args[$u];\n",
+            call_buffer.base_reg, call_buffer.base_param_index - 1);
 
     for (uint32_t gi = group.start; gi != group.end; ++gi) {
         uint32_t index = schedule[gi].index;
@@ -892,6 +1294,70 @@ void jitc_hip_assemble(ThreadState *ts, ScheduledGroup group,
     }
 
     put("}\n");
+
+    // -------------------------------------------------------------------
+    //   Callables and other globals
+    // -------------------------------------------------------------------
+    //
+    // Bodies go AFTER the kernel; forward declarations are then moved before
+    // it, because C++ requires declare-before-use and the kernel calls them.
+    // Metal does the same for the same reason (§9).
+    //
+    // Unlike Metal, EVERY callable needs a declaration here, not just
+    // single-target ones: with switch dispatch the multi-target callables are
+    // named at the call site too, rather than being reached anonymously
+    // through a function table (§9a).
+    if (!globals_map.empty()) {
+        // Callable bodies, appended after the kernel.
+        for (auto &it : globals_map) {
+            if (it.first.type == GlobalType::Global)
+                continue;
+            put('\n');
+            put(globals.get() + it.second.start, it.second.length);
+            put('\n');
+        }
+
+        // Then the chunk that has to precede everything, built at the end and
+        // relocated: struct definitions in full, plus one forward declaration
+        // per callable.
+        size_t suffix_start = buffer.size();
+
+        // GlobalType::Global entries are full inline definitions -- the vcall
+        // return structs among them. They are NOT forward-declarable: a
+        // callable's signature names its return type by value, so the
+        // definition must come first, not just a declaration.
+        for (auto &it : globals_map) {
+            if (it.first.type != GlobalType::Global)
+                continue;
+            put('\n');
+            put(globals.get() + it.second.start, it.second.length);
+            put('\n');
+        }
+
+        // Declarations for EVERY callable, not just single-target ones as
+        // Metal does: switch dispatch names its targets, so multi-target
+        // callables are referenced by name too (§9a). This also lets callables
+        // call each other regardless of emission order.
+        for (auto &it : globals_map) {
+            if (it.first.type == GlobalType::Global)
+                continue;
+            const char *sig = globals.get() + it.second.start;
+            const char *brace =
+                (const char *) memchr(sig, '{', it.second.length);
+            if (!brace)
+                continue;
+            size_t len = (size_t) (brace - sig);
+            while (len > 0 && (sig[len - 1] == ' ' || sig[len - 1] == '\n'))
+                len--;
+            put(sig, len);
+            put(";\n");
+        }
+
+        // Target: immediately after the type preamble, which every declaration
+        // depends on and which nothing depends on.
+        if (suffix_start != buffer.size())
+            buffer.move_suffix(suffix_start, strlen(hip_type_preamble));
+    }
 
     jitc_call_upload(ts);
 }

@@ -1326,6 +1326,12 @@ XXH128_hash_t jitc_assemble_func(const CallData *call, uint32_t inst,
             break;
 #endif
 
+#if defined(DRJIT_ENABLE_HIP)
+        case JitBackend::HIP:
+            jitc_hip_assemble_func(call, inst);
+            break;
+#endif
+
         default:
             jitc_fail("jitc_assemble_func(): unsupported backend!");
     }

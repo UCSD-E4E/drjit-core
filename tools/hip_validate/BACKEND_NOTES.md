@@ -217,8 +217,53 @@ all; every arm is a direct call the compiler may inline. The cost is code size
 proportional to the instances reachable from each call site — worth measuring
 on a real Mitsuba scene (§5 Phase 2 "codegen tuning"), not worth pre-empting.
 
-Note the indices are **sparse** at any one site, because the index space is
-kernel-wide. A `switch` handles that; an array would need holes.
+### 9b. What the switch actually keys on
+
+Not the callable index — **the instance ID (`self`)**. The callable index is
+assigned in a pass over `globals_map` that has not run when the dispatch site
+is written, so its value is not available as a `case` label. Instance IDs are,
+via `call->inst_id[]`.
+
+Instances sharing a callable are grouped so their labels fall through to **one**
+call body:
+
+```c
+switch (r7) {
+    case 1:
+    case 4:
+        ret_9 = func_<hashA>(r0, r7, _cd_9, r3); break;
+    case 2:
+        ret_9 = func_<hashB>(r0, r7, _cd_9, r3); break;
+    default:
+        ret_9.r0 = (f32) 0; break;
+}
+```
+
+So code size scales with *unique callables*, not with instances — which matters
+because a Mitsuba scene has far more shapes than BSDF types. The `default` arm
+is not dead code: `self` is data, and an instance ID outside this site's set
+must produce something defined.
+
+A consequence worth knowing: **HIP never reads the offset table's low half.**
+`jitc_call_upload()` still packs `(data_offset << 32) | callable_index` for
+every backend; HIP uses only the high half, for the instance's data pointer.
+
+### 9c. Emission order
+
+Three chunks, in this order in the final source:
+
+1. type preamble
+2. **struct definitions in full** (`GlobalType::Global` — the vcall return
+   structs live here) **+ one forward declaration per callable**
+3. kernel, then callable bodies
+
+Chunk 2 is built last and relocated with `buffer.move_suffix()`. The return
+structs must be *definitions*, not declarations: a callable's signature names
+its return type by value.
+
+Unlike Metal, **every** callable needs a declaration, not just single-target
+ones. Metal can skip multi-target callables because they are reached
+anonymously through the function table; switch dispatch names them.
 
 ---
 
@@ -460,12 +505,16 @@ Two are worth carrying forward as patterns rather than incidents:
 | `test_loop` | 9/9 |
 | `test_mem` | 17/17 |
 | `test_reductions` | 14/14 |
+| `test_vcall` | 14/14 |
 | `test_array` | skipped — `VarKind::Array` |
 | `test_record` | skipped — frozen-function recording |
-| `test_vcall` | skipped — call machinery |
 
-The three skips are listed in `tests/test.cpp` and PRINT their reason on every
-run. Delete an entry when the subsystem lands.
+The remaining skips are listed in `tests/test.cpp` and PRINT their reason on
+every run. Delete an entry when the subsystem lands.
+
+(`test14_frozen_vcall` returns early on HIP: it is the one test in that suite
+about recording rather than calls, and losing the other 13 to an unrelated gap
+would be the wrong trade. The early return is annotated in place.)
 
 ### `test_graphviz` fails, and it is not ours
 
