@@ -14,6 +14,9 @@
 #include "op.h"
 #include "optix_api.h"
 #include "optix.h"
+#if defined(DRJIT_ENABLE_LLVM)
+#  include "llvm.h"  // jitc_llvm_version_major, for jitc_coop_vec_supported()
+#endif
 
 #if defined(DRJIT_ENABLE_METAL)
 // On Metal, FP16 reduces into an FP32 buffer (narrowed back afterwards)
@@ -40,15 +43,57 @@ static uint32_t unwrap(uint32_t index) {
 }
 
 bool jitc_coop_vec_supported(JitBackend backend) {
+#if defined(DRJIT_ENABLE_HIP)
+    // The HIP backend has no cooperative-vector support: jitc_hip_render()
+    // implements none of the CoopVec* opcodes and HIPThreadState::coop_vec_pack
+    // raises. Saying "true" here -- which the fallthrough below did, because it
+    // only ever asked about CUDA -- meant the unsupported path was reached and
+    // jitc_fail()ed, and jitc_fail ABORTS. A whole pytest process died on one
+    // unsupported feature instead of reporting a skip.
+    //
+    // Same shape as jitc_can_scatter_reduce()'s missing HIP arm (Phase 4): a
+    // capability table whose default is "yes" is a trap for any backend added
+    // after it was written.
+    if (jitc_is_hip(backend))
+        return false;
+#endif
 #if defined(DRJIT_ENABLE_CUDA)
     if (jitc_is_cuda(backend))
         return (jitc_cuda_version_major == 12 &&
                 jitc_cuda_version_minor >= 8) ||
                jitc_cuda_version_major > 12;
-#else
-    (void) backend;
 #endif
+#if defined(DRJIT_ENABLE_LLVM)
+    // LLVM's requirement (>= 17.0) used to be re-derived in each test file that
+    // needed it, alongside the CUDA one. Answering it here makes this function
+    // the single authority, so a caller need only ask one question.
+    if (jitc_is_llvm(backend))
+        return jitc_llvm_version_major >= 17;
+#endif
+    (void) backend;
     return true;
+}
+
+/// Raise (never fail) if `backend` cannot do cooperative vectors.
+///
+/// Every public entry point that will end up calling a ThreadState coop_vec_*
+/// method has to ask this first. The unsupported path bottoms out in
+/// jitc_fail(), which ABORTS -- so a missing check here is not a bad error
+/// message, it is the caller's process dying. There are two such entry points,
+/// not one: jitc_coop_vec_pack() builds a vector, and
+/// jitc_coop_vec_pack_matrices() (drjit.nn.pack) packs weight matrices without
+/// ever constructing one. Guarding only the first left `nn.pack()` aborting.
+static void coop_vec_check_supported(const char *caller, JitBackend backend) {
+    if (jitc_coop_vec_supported(backend))
+        return;
+
+    // Name the backend that actually failed. The message used to say
+    // "CUDA/OptiX" unconditionally, which sent a HIP failure looking for a CUDA
+    // driver that was never involved.
+    jitc_raise("%s(): the %s backend does not support cooperative vectors. "
+               "(CUDA requires 12.8 or newer, i.e. driver R570+; LLVM requires "
+               "17.0 or newer; HIP does not support them at all.)",
+               caller, jitc_backend_name(backend));
 }
 
 uint32_t jitc_coop_vec_pack(uint32_t n, const uint32_t *in) {
@@ -63,10 +108,7 @@ uint32_t jitc_coop_vec_pack(uint32_t n, const uint32_t *in) {
     }
 
     const Variable *arg_v = jitc_var(in[0]);
-    if (!jitc_coop_vec_supported((JitBackend) arg_v->backend))
-        jitc_raise("jit_coop_vec_pack(): The use of cooperative vectors on "
-                   "the CUDA/OptiX backend requires CUDA 12.8 or newer "
-                   "(which corresponds to driver version R570+).");
+    coop_vec_check_supported("jit_coop_vec_pack", (JitBackend) arg_v->backend);
 
     Variable v;
     v.kind = (uint32_t) VarKind::CoopVecPack;
@@ -454,6 +496,8 @@ void jitc_coop_vec_pack_matrices(uint32_t count,
                  count, count == 1 ? "matrix" : "matrices", out_v->size * type_size[out_v->type], in, out);
         backend = (JitBackend) out_v->backend;
     }
+
+    coop_vec_check_supported("jit_coop_vec_pack_matrices", backend);
 
     thread_state(backend)->coop_vec_pack(count, in_p, in_descr, out_p, out_descr);
 }

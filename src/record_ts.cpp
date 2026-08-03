@@ -2710,19 +2710,56 @@ static void swap_in_record_ts(JitBackend backend, ThreadState *record_ts) {
     for_each_thread_state_slot([&](JitBackend b, ThreadState **slot) {
         if (b == backend)
             *slot = record_ts;
-        else
+    });
+    for_each_thread_state_slot([&](JitBackend b, ThreadState **slot) {
+        if (b != backend)
             set_disabled_thread_state(slot, backend);
     });
 }
 
 /// The inverse: restore `internal` and re-enable the others.
+///
+/// The two passes are NOT cosmetic, and getting this wrong cost a segfault that
+/// looked nothing like its cause (`test72_no_input`, crashing in `__dynamic_cast`
+/// one test later).
+///
+/// `unset_disabled_thread_state()` RETHROWS the exception a disabled slot
+/// recorded -- which is the normal outcome here, since a frozen function that
+/// touched the wrong backend is exactly what disabling detects. If that throw
+/// escapes before `backend`'s own slot is restored, the slot is left pointing at
+/// the RecordThreadState that the caller (`RecordThreadStateGuard`) is about to
+/// delete. The result is a dangling, non-null thread state: the next
+/// `thread_state(backend)` hands it back, and the `dynamic_cast` in
+/// `jitc_freeze_abort()` faults reading a freed vptr.
+///
+/// So: restore this backend's slot first, and only then re-enable the others.
+/// Upstream's if/else chain happened to be written in that order; the ordering
+/// was load-bearing and unremarked, and flattening the chain into one loop
+/// silently reversed it.
 static void swap_out_record_ts(JitBackend backend, ThreadState *internal) {
     for_each_thread_state_slot([&](JitBackend b, ThreadState **slot) {
         if (b == backend)
             *slot = internal;
-        else
-            unset_disabled_thread_state(slot);
     });
+
+    // Every remaining slot must be visited even if one of them throws --
+    // otherwise the slots after it stay wrapped in a DisabledThreadState that
+    // nothing will ever unwrap. Hold the first exception, finish the sweep,
+    // then rethrow it.
+    std::exception_ptr pending;
+    for_each_thread_state_slot([&](JitBackend b, ThreadState **slot) {
+        if (b == backend)
+            return;
+        try {
+            unset_disabled_thread_state(slot);
+        } catch (...) {
+            if (!pending)
+                pending = std::current_exception();
+        }
+    });
+
+    if (pending)
+        std::rethrow_exception(pending);
 }
 
 /// Remove a recording thread state from the compaction registry

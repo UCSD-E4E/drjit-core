@@ -510,6 +510,24 @@ ThreadState *jitc_init_thread_state(JitBackend backend) {
                        "because no device was detected.");
 
 # if defined(DRJIT_HIP_CUDA_SHIM)
+        // The scaffold warning lives here rather than in jitc_hip_init(),
+        // which runs on jit_init_async()'s background thread while holding
+        // state.lock: a Warn there reaches drjit's Python log callback, which
+        // wants the GIL, and deadlocks against a main thread that holds the
+        // GIL and waits on state.lock. This site runs on the caller's own
+        // thread, and only when the backend is actually used.
+        static bool shim_warned = false;
+        if (!shim_warned) {
+            shim_warned = true;
+            jitc_log(Warn,
+                     "jit_init_thread_state(): the HIP backend is running on "
+                     "the CUDA SHIM (DRJIT_HIP_CUDA_SHIM). HIP codegen is "
+                     "executing on an NVIDIA device at warp_size=%u. This is a "
+                     "development scaffold: it does not exercise the HIP "
+                     "runtime API, and wave64 semantics are NOT verified.",
+                     state.hip_devices[0].warp_size);
+        }
+
         // Under the shim, HIPThreadState IS a CUDAThreadState (see hip_ts.h),
         // so it needs the CUDA device's stream and events -- it will really
         // submit work through them.

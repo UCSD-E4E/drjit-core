@@ -350,12 +350,24 @@ bool jitc_hip_init() {
 
     state.hip_devices.push_back(dev);
 
-    jitc_log(Warn,
-             "jit_hip_init(): running the CUDA SHIM (DRJIT_HIP_CUDA_SHIM). "
-             "HIP codegen is executing on an NVIDIA device at warp_size=%u. "
-             "This is a development scaffold: it does not exercise the HIP "
-             "runtime API, and wave64 semantics are NOT verified.",
-             dev.warp_size);
+    // Info, NOT Warn -- a correctness constraint rather than a matter of taste.
+    //
+    // jit_init_async() runs backend initialization on a BACKGROUND thread that
+    // holds state.lock. A Warn-level message reaches drjit's Python log
+    // callback, which acquires the GIL -- while the main thread holds the GIL
+    // and waits on state.lock. That lock-order inversion deadlocks at
+    // interpreter EXIT: the process does all of its work and prints correct
+    // results, then never terminates, with both threads spinning. It cost most
+    // of a day, because every symptom pointed at the code that ran BEFORE it.
+    //
+    // Info-level messages do not reach the Python callback at the default log
+    // level, which is why every other backend's init logs freely. The loud
+    // scaffold warning still exists -- jitc_init_thread_state() emits it on the
+    // caller's own thread, which is also the more useful moment: it fires when
+    // the backend is actually USED rather than merely linked in.
+    jitc_log(Info,
+             "jit_hip_init(): running the CUDA SHIM (DRJIT_HIP_CUDA_SHIM) at "
+             "warp_size=%u.", dev.warp_size);
     return true;
 }
 

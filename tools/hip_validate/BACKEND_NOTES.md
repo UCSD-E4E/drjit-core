@@ -869,6 +869,276 @@ the handles are actually created, drop the reference, assert the callback ran.
 Verified by reinstating the cycle and watching it fail. Any future per-scene
 resource cached this way needs the same treatment.
 
+## 11j. Layer B — every failure was silent
+
+Phase 6 (`drjit.hip` / `drjit.hip.ad`) is mechanical work with one lesson worth
+carrying into Layer C: **not one of the bugs announced itself.** Each produced a
+plausible-looking system that was simply wrong somewhere else.
+
+`drjit.hip` came out empty — `module 'drjit.hip' has no attribute 'Float'` —
+and that single symptom had **two independent causes, either of which would
+have produced it alone**:
+
+1. `detail::backend<T>` in `array_traits.h` specialises for CUDA, LLVM and
+   Metal. With no HIP arm the primary template applies and
+   `backend_v<HIPArray<float>>` is `JitBackend::None`, so `drjit::bind()` files
+   every HIP type under `drjit.scalar`.
+2. `ArrayMeta::backend` was a **2-bit** field. `JitBackend::HIP` is 4, which
+   truncates to 0 — the same wrong answer by a different route.
+
+Fixing one alone would have left the symptom unchanged and sent the search in
+the wrong direction. This is the **third** packed backend field caught one bit
+too narrow (`Variable::backend`, `AllocInfo`, now `ArrayMeta::backend`), so
+that one now carries `static_assert((uint32_t) JitBackend::Count <= 8, ...)`
+beside it.
+
+### Widening ArrayMeta was not free, and the fallout was worth having
+
+`ArrayMeta`'s bitfields filled a `uint32_t` exactly. Neither neighbour could
+give up a bit — `tsize_rel` reaches exactly 64 for
+`Array<Array<Array<JitArray<float>,4>,4>,4>`, and `talign` reaches 64 for
+AVX-512-aligned types. (Both bounds were found by narrowing them and reading
+the `static_assert` that fired, which is the cheap way to answer this.)
+
+So the struct is 12 bytes now, and the two places that assumed 8 —
+`operator==`'s whole-struct `memcmp` and `meta_get_type()`'s `uint64_t` cache
+key — had to change. They now share a `meta_identity()` helper, which is
+**more** correct than what it replaced: with 33 bits of bitfields the second
+word is nearly all padding, and padding is indeterminate, so memcmp'ing the
+whole struct would have been a latent bug regardless of HIP.
+
+### Thirteen per-backend chains in shipped code, plus six in the tests
+
+Sites in shared code that enumerated backends and omitted HIP, in this phase
+alone: `detail::backend`, `interop.py::_migrate_backend` (which sent anything
+not CUDA or Metal to **LLVM**), `math.cpp::is_gpu`, `dlpack.cpp` and
+`init.cpp`'s "is this device memory" tests, `meta.cpp`'s module index and
+`__meta__` string, `freeze.cpp`'s diagnostic names, `main.cpp`'s `JitBackend`
+enum binding and `array_submodules` table, `base.cpp`'s backend test,
+`quat.cpp`'s export list, `coop_vec.cpp`'s capability table, and the three
+layers of `Resampler` described below.
+
+The dlpack one is the instructive failure: HIP fell through to *host*, so a
+device pointer would have been handed to a consumer labelled CPU — a segfault
+in somebody else's process. The device tests now go through
+`is_device_backend()` in `src/python/common.h`, so there is one place to add to
+rather than five.
+
+**For Layer C, grep before building.** `JitBackend::CUDA`, `is_cuda_v`,
+`MI_ENABLE_CUDA` and `backend == ` are the patterns; the ones that read as
+"this is a GPU" rather than "this is CUDA specifically" are the ones that will
+be wrong.
+
+### One feature, four layers, and the one that hides
+
+`Resampler` was missing HIP in **four** places at once, and they fail
+differently:
+
+| Layer | File | Symptom if only this one is missing |
+|---|---|---|
+| Python binding | `src/python/resample.cpp` | `TypeError` on a HIP argument |
+| Explicit instantiation | `src/extra/resample.cpp` | link error, named symbol |
+| **CMake define** | `src/extra/CMakeLists.txt` | link error, and the source looks correct |
+| Type export | `src/python/quat.cpp` | attribute missing from the module |
+
+The CMake one is the trap. `src/extra/CMakeLists.txt` re-derives
+`-DDRJIT_ENABLE_HIP` per target, and without it the instantiations sit inside a
+`#if` that is false — so the code is right, reads as right, and is compiled out.
+The error is an `undefined symbol` for a template you can see being
+instantiated. **When a link error names a symbol whose definition is plainly
+there, check whether that target got the define.**
+
+### Capability tables must default to "unsupported"
+
+`jitc_coop_vec_supported()` asked only about CUDA and returned `true` otherwise.
+HIP implements no `CoopVec*` opcode at all, so the "supported" path ran and hit
+`jitc_fail()` — which **aborts**. A whole pytest process died on one unsupported
+feature instead of reporting a skip. Same shape as `jitc_can_scatter_reduce()`'s
+missing HIP arm in Phase 4.
+
+Two rules fall out:
+
+- **A capability table whose fallthrough is "yes" is a trap for every backend
+  added after it was written.** Ask the negative question first.
+- **Don't reach `jitc_fail()` for a capability question.** `jitc_fail` aborts;
+  `jitc_raise` throws and becomes a catchable Python exception. Unsupported is
+  not a bug in the caller.
+
+The corollary is that the *test* suite must ask the library rather than
+enumerate backends. `test_coop_vec.py` and `test_nn.py` each carried their own
+`skip_if_coopvec_not_supported()` re-deriving the CUDA and LLVM version gates by
+hand, so HIP was "supported" in both. Both now call
+`dr.detail.coop_vec_supported()`, and `jitc_coop_vec_supported()` answers for
+LLVM (>= 17.0) too so there is exactly one authority. The raise message no
+longer hardcodes "CUDA/OptiX" either — it named a CUDA driver requirement for a
+failure in which CUDA was never involved.
+
+Other test-side backend enumerations found the same way: `test_traits.py`'s
+`is_jit` list (272 failures from one missing string) and three sites in
+`test_init.py` asserting that a backend aliases host `ndarray` memory rather
+than copying — true only of LLVM. Those now name LLVM positively, so the next
+device backend takes the safe branch by default.
+
+### `@dr.freeze` needed no work — check parity, not absolutes
+
+A standalone test asserting that a frozen function traces once and then replays
+reported four traces on HIP. It reports four on CUDA and LLVM too. The
+expectation was wrong, not the backend, and an absolute assertion would have
+sent someone hunting a HIP bug that does not exist. Compare against a reference
+backend, and let upstream's own `test_freeze.py` be the real check.
+
+## 11k. Never log above Info during backend init
+
+This one cost most of a day, so it gets its own section.
+
+**Symptom.** Every test passed. Results were correct and printed. The process
+then never exited — it sat at 100% CPU after the last line of output, and had to
+be killed.
+
+**Cause.** `jit_init_async()` runs backend initialization on a **background
+thread that holds `state.lock`**. The HIP shim logged its scaffold warning at
+`Warn` level. Warn-level messages reach drjit's Python log callback, which
+acquires the **GIL**. Meanwhile the main thread holds the GIL and is waiting on
+`state.lock`. Classic lock-order inversion; it only becomes fatal at interpreter
+shutdown, when `Py_Finalize` joins the thread that can never make progress.
+
+**Why it was hard.** The deadlock happens *after* all useful work, so every
+symptom points at code that ran before it and completed fine. I misread it as an
+import hang more than once. What settled it was a backtrace showing
+`atexit_callfuncs` → `_Py_Finalize` — i.e. the process was already past the end
+of the program.
+
+**Getting that backtrace on this machine:** `ptrace_scope=1` means you cannot
+attach gdb to a running process; you must *launch* under gdb.
+
+```
+gdb -q --args python3 -m pytest ...     # attach won't work; launch will
+thread apply all bt
+```
+
+**Rules.**
+
+- Backend `*_init()` runs on a lock-holding background thread. Log at `Info`,
+  never `Warn` or above. Info does not reach the Python callback at the default
+  log level, which is why every other backend logs freely there.
+- If you need a message the user will actually see, emit it from
+  `jitc_init_thread_state()` instead — that runs on the caller's own thread, and
+  fires when the backend is *used* rather than merely linked in, which is the
+  more useful moment anyway.
+- **A process that produces correct output and then hangs is a shutdown bug, not
+  a startup bug.** Check `Py_Finalize` before re-reading the code that worked.
+
+## 11m. A skipped test is not a passing test
+
+The suite reported "green" while **497 tests never ran** — the seven C++
+extension suites (`test_call_ext`, `test_memop_ext`, `test_local_ext`,
+`test_while_loop_ext`, `test_if_stmt_ext`, `test_custom_type_ext`,
+`test_py_cpp_consistency_ext`). They print as `s`, which reads identically to
+"not applicable on this backend".
+
+Three independent reasons, each sufficient, stacked on top of each other:
+
+1. `DRJIT_ENABLE_TESTS` defaults to **OFF**, so the extension modules did not
+   exist and `pytest.importorskip` skipped everything.
+2. `tests/CMakeLists.txt` passed `-DDRJIT_ENABLE_LLVM/CUDA/METAL` to each
+   module but **not** `-DDRJIT_ENABLE_HIP` — the same missing-define as
+   `src/extra/CMakeLists.txt`. The HIP submodule would have been compiled out
+   even with the tests built.
+3. All seven `get_pkg()` helpers mapped backend → submodule with an if/elif
+   chain ending at Metal, so HIP fell off the end and `get_pkg()` returned
+   **None**. Every test would then have failed on `None.A`, pointing at the
+   test body rather than at the missing arm.
+
+Fixed at all four levels — four, because after replacing the seven `get_pkg()`
+chains there was an **eighth** copy inside `test_freeze.py`, which is not an
+`_ext` file and so was not on the list. It surfaced only after the other three
+fixes let those tests run at all, as `'NoneType' object has no attribute 'A'`
+across 40 frozen-vcall tests. The chains are gone now: `conftest.py` has one
+`get_backend_submodule()` that looks the submodule up by the backend's own name.
+
+When you fix a duplicated pattern, grep for the *pattern* (`def get_pkg`), not
+for the files you expect to contain it.
+
+**These suites matter for Layer C** — `call_ext` is the C++ side of vcall
+dispatch, which §9a-c calls the risky part of the Mitsuba port. Unlocking them
+also unlocked ~120 tests inside `test_freeze.py` that use `call_ext`, including
+the frozen-vcall set (`test23/24/25`, `test59/60`, `test86/87`, `test95`). All
+of it passes on HIP under the shim — **the first direct evidence that HIP vcall
+dispatch works end to end**, which is the single most useful result to carry
+into Phase 7.
+
+Only two things needed fixing once these ran, both test-side assumptions rather
+than backend bugs: `cleanup()` stripped `.llvm.`/`.cuda.`/
+`.metal.` from reprs but not `.hip.`, and `test14_array_call_self` assumed any
+backend that is not LLVM or Metal emits PTX. HIP emits source text, so `self`
+appears as `u32 rN = self;` (hip_eval.cpp) rather than in a PTX parameter list;
+that assertion now keys on what the backend *emits* and defaults to the source
+form.
+
+**Run the sweep from `build-hip/tests`, not the source tree** — that is where
+the `.so` files live, and it is the difference between 497 tests running and
+497 tests silently skipping. Note that CMake copies the `.py` files there with
+`configure_file(COPYONLY)`, so **editing `tests/*.py` requires re-running cmake**
+before the change reaches the copy you are executing.
+
+## 11l. De-duplicating a per-backend chain can reverse a load-bearing order
+
+The one bug in this port that was **caused by removing** a per-backend chain
+rather than by a chain missing an arm. Worth reading before doing the same
+refactor in Layer C.
+
+`jitc_freeze_start/stop/abort` each carried the same CUDA/Metal/LLVM if/else
+chain for swapping thread-state slots, and HIP fell into the trailing `else`,
+which assigned the recorder to the **LLVM** slot. The fix — enumerate the slots
+once in `for_each_thread_state_slot()` and drive all three sites from it — is
+right, and it is what `swap_in_record_ts` / `swap_out_record_ts` do now.
+
+But the original chain restored *the recording backend's own slot first* and
+disabled the others afterwards. That ordering was not commented and looked
+incidental. It is not:
+
+- `unset_disabled_thread_state()` **rethrows** the exception a disabled slot
+  recorded — the normal outcome, since catching a frozen function that touched
+  the wrong backend is precisely what disabling is for.
+- A single loop over the slots visits LLVM before CUDA. So when freezing
+  against backend CUDA, the LLVM slot throws *before* the CUDA slot is restored.
+- The CUDA slot is then still pointing at the `RecordThreadState`, which
+  `RecordThreadStateGuard` deletes on the way out.
+- Result: a **dangling, non-null** thread state. Nothing fails yet. The next
+  `thread_state(CUDA)` hands it back and `dynamic_cast` faults reading a freed
+  vptr — in a later test, in a function that has nothing to do with the bug.
+
+`swap_out_record_ts()` now runs two passes: restore this backend's slot, then
+re-enable the rest, holding the first exception so that a throw cannot skip the
+remaining slots. (The old chain leaked the Metal slot for the same reason; the
+two-pass form fixes that too.)
+
+**The general shape:** when you replace N copies of a chain with one loop, the
+copies may not have been identical. Diff them against each other, not just
+against your replacement — an ordering that appears in every copy is a
+specification, not a coincidence.
+
+### Two corollaries about how this was found
+
+**A crash masks everything after it.** test72 aborted `test_freeze.py` at 94%,
+hiding two further crashes: `jit_coop_vec_pack_matrices` had no capability guard
+(`nn.pack()` reaches it without ever calling `jitc_coop_vec_pack`, so guarding
+only the latter left `nn.pack` aborting), and `test_freeze.py` turned out to
+hold a **third** hand-rolled `skip_if_coopvec_not_supported`. Fixing one crash
+is not progress until you re-run and see what it was covering.
+
+**"HIP off" is not "our changes off."** The crash reproduced in a build with
+`DRJIT_ENABLE_HIP=OFF`, which read as proof it was upstream's. It was not: that
+build still contained every Phase 1–5 drjit-core commit, including the refactor
+above. Only a build at the true merge-base (drjit `9a7db92b` + drjit-core
+`7a9ab1fa`) answered the question, and it passed 744 tests clean. A control has
+to differ in exactly the variable under test — and this one nearly got written
+up as somebody else's bug.
+
+(Aside, if you ever build that control: upstream at `9a7db92b` does **not**
+compile with `DRJIT_ENABLE_CUDA=OFF` — `optix_api.h` names `CUcontext`,
+`CUstream` and `CUdeviceptr` unguarded. Configure the control with CUDA on.)
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
