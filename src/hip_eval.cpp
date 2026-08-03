@@ -381,50 +381,48 @@ static void render_scatter_packet(Variable *v, Variable *ptr, Variable *index,
 //  Ray tracing (HIP-RT)
 // ---------------------------------------------------------------------------
 
-/// Register the HIP-RT include and the two hook definitions HIP-RT requires.
+/// Register the HIP-RT device header ahead of the kernel body.
 ///
-/// This is not boilerplate that could be dropped. HIP-RT DECLARES
-/// `intersectFunc` and `filterFunc` -- the custom-primitive intersection and
-/// any-hit filter hooks, its analogue of Metal's intersection function table --
-/// and leaves the definitions to the application. A kernel that traverses
-/// without them does not fail at run time; it fails to LINK, with
-/// `undefined hidden symbol: intersectFunc(...)`. Discovered by the Phase 0b
-/// spike (BACKEND_NOTES §7a finding 3), which is the only reason it is here
-/// rather than a week into integration.
+/// Deliberately NOT the `intersectFunc` / `filterFunc` definitions, and the
+/// reason is worth stating because BACKEND_NOTES §7a originally concluded the
+/// opposite.
+///
+/// HIP-RT declares those two hooks and requires SOMEONE to define them. Who
+/// depends on how the traversal library is linked:
+///
+///   * Hand-linking the device bitcode (`-Xclang -mlink-bitcode-file`, which
+///     is what tools/hip_validate does) leaves them undefined, and the link
+///     fails with `undefined hidden symbol: intersectFunc(...)`. That is where
+///     §7a met them.
+///
+///   * hiprtBuildTraceKernels() -- the API the backend actually compiles
+///     through, on the shim and on real hardware alike -- GENERATES them from
+///     its numGeomTypes / numRayTypes / funcNameSets arguments and prepends
+///     them to the source. An application definition is then a duplicate, and
+///     the build fails with "function has already been defined".
+///
+/// So emitting them is correct for the harness and wrong for the backend.
+/// run_tests.sh prepends them when it hand-links, which is the path that needs
+/// them; codegen leaves them to HIP-RT.
 ///
 /// Registration dedups by content, so a kernel with a hundred traces emits one
 /// copy, and the globals machinery places it ahead of the kernel body.
 static void jitc_hip_emit_trace_preamble(const HIPScene *scene) {
-    size_t off = buffer.size();
-    put("#include <hiprt/hiprt_device.h>\n");
-    jitc_register_global(buffer.get() + off);
-    buffer.rewind_to(off);
-
     // A function table means the scene has custom primitives, and HIP-RT
-    // dispatches through these hooks to intersect them. Forwarding is not
-    // implemented, and stubbing it would report a miss for every custom shape
-    // -- a black object in a render, a very long way from its cause. Fail here
-    // instead, at the moment the offending scene is used.
+    // dispatches through the hooks to intersect them -- which means telling
+    // hiprtBuildTraceKernels() about the geometry and ray types so it can
+    // generate the right dispatch. That is not wired up, and proceeding would
+    // report a miss for every custom shape: a black object in a render, a very
+    // long way from its cause. Fail at the moment the offending scene is used.
     if (scene && scene->func_table)
         jitc_raise("jitc_hip_render(): this scene was configured with a "
                    "hiprtFuncTable, but custom-primitive intersection "
                    "functions are not implemented (PLAN.md Phase 5). Build the "
-                   "scene without one, or implement the dispatch in "
-                   "jitc_hip_emit_trace_preamble().");
+                   "scene without one, or pass the geometry/ray types through "
+                   "to hiprtBuildTraceKernels().");
 
-    // No custom primitives: these stubs are the correct implementation, not a
-    // placeholder. `intersectFunc` reporting no hit means "this geometry has no
-    // custom intersector", and `filterFunc` returning false means "do not
-    // reject this hit".
-    off = buffer.size();
-    put("__device__ bool intersectFunc(unsigned, unsigned,\n"
-        "                              const hiprtFuncTableHeader &,\n"
-        "                              const hiprtRay &, void *,\n"
-        "                              hiprtHit &) { return false; }\n"
-        "__device__ bool filterFunc(unsigned, unsigned,\n"
-        "                           const hiprtFuncTableHeader &,\n"
-        "                           const hiprtRay &, void *,\n"
-        "                           const hiprtHit &) { return false; }\n");
+    size_t off = buffer.size();
+    put("#include <hiprt/hiprt_device.h>\n");
     jitc_register_global(buffer.get() + off);
     buffer.rewind_to(off);
 }

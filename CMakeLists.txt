@@ -405,6 +405,40 @@ if (DRJIT_ENABLE_HIP)
     endif()
     target_compile_definitions(drjit-core PRIVATE -DDRJIT_HIP_CUDA_SHIM=1)
     message(STATUS "Dr.Jit-Core: HIP backend running on the CUDA SHIM (dev only).")
+
+    # Ray tracing under the shim needs HIP-RT itself, because a generated
+    # kernel that traverses cannot be compiled by bare NVRTC: it includes
+    # <hiprt/hiprt_device.h> and has to be LINKED against the traversal
+    # library. hiprtBuildTraceKernels() does both.
+    #
+    # This must be the CUDA-enabled HIP-RT build ($HIPRT_NV_PATH from the #hip
+    # dev shell), not the stock package, which cannot target NVIDIA at all --
+    # see the hipRtNv derivation in flake.nix.
+    #
+    # Linked rather than dlopen'd: HIP-RT's entry points take C++ references,
+    # so their symbols are mangled and dlsym would be hostage to the compiler's
+    # mangling. This is a development configuration, so a hard dependency is
+    # acceptable here in a way it would not be in the real backend.
+    if (NOT DEFINED DRJIT_HIPRT_PATH AND DEFINED ENV{HIPRT_NV_PATH})
+      set(DRJIT_HIPRT_PATH "$ENV{HIPRT_NV_PATH}" CACHE PATH
+          "CUDA-enabled HIP-RT, for ray tracing under the HIP/CUDA shim")
+    endif()
+
+    if (DRJIT_HIPRT_PATH AND EXISTS "${DRJIT_HIPRT_PATH}/include/hiprt/hiprt.h")
+      target_include_directories(drjit-core PRIVATE "${DRJIT_HIPRT_PATH}/include")
+      target_link_directories(drjit-core PRIVATE "${DRJIT_HIPRT_PATH}/lib")
+      target_link_libraries(drjit-core PRIVATE hiprt64)
+      target_compile_definitions(drjit-core PRIVATE
+        -DDRJIT_HIP_SHIM_HIPRT=1
+        -DDRJIT_HIP_SHIM_HIPRT_PATH="${DRJIT_HIPRT_PATH}")
+      set_property(TARGET drjit-core APPEND PROPERTY
+                   BUILD_RPATH "${DRJIT_HIPRT_PATH}/lib")
+      message(STATUS "Dr.Jit-Core: shim ray tracing via HIP-RT at ${DRJIT_HIPRT_PATH}.")
+    else()
+      message(STATUS "Dr.Jit-Core: no CUDA-enabled HIP-RT found "
+                     "(set DRJIT_HIPRT_PATH or $HIPRT_NV_PATH); traced kernels "
+                     "will raise under the shim.")
+    endif()
   endif()
 endif()
 

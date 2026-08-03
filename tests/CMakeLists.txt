@@ -162,6 +162,25 @@ if (DRJIT_ENABLE_HIP)
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
   set_tests_properties(hip_trace hip_trace_shadow
                        PROPERTIES SKIP_RETURN_CODE 77)
+
+  # The traced kernel, actually executed. Needs the CUDA-enabled HIP-RT both to
+  # build a scene here and (inside drjit-core) to compile the traversal, so it
+  # only exists when the shim found one.
+  if (DRJIT_HIPRT_PATH AND EXISTS "${DRJIT_HIPRT_PATH}/include/hiprt/hiprt.h")
+    add_executable(hip_trace_exec hip_trace_exec.cpp)
+    set_property(TARGET hip_trace_exec PROPERTY CXX_STANDARD 17)
+    target_include_directories(hip_trace_exec PRIVATE "${DRJIT_HIPRT_PATH}/include")
+    target_link_directories(hip_trace_exec PRIVATE "${DRJIT_HIPRT_PATH}/lib")
+    target_link_libraries(hip_trace_exec PRIVATE drjit-core hiprt64)
+    set_property(TARGET hip_trace_exec APPEND PROPERTY
+                 BUILD_RPATH "${DRJIT_HIPRT_PATH}/lib")
+    add_test(NAME hip_trace_exec COMMAND hip_trace_exec
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+    # HIP-RT finds its device libraries and builder kernels relative to this.
+    set_tests_properties(hip_trace_exec PROPERTIES
+      SKIP_RETURN_CODE 77
+      ENVIRONMENT "HIPRT_PATH=${DRJIT_HIPRT_PATH}")
+  endif()
 endif()
 
 add_executable(microbenchmark microbenchmark.cpp)

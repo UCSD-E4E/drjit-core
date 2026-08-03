@@ -105,10 +105,18 @@ fi
 # actually produces: tests/hip_trace writes the assembled kernel out, and it is
 # compiled and LINKED here for real gfx90a.
 #
-# The link is the point. HIP-RT declares intersectFunc/filterFunc and leaves the
-# definitions to the application, so a backend that forgets to emit them
-# produces source that compiles cleanly everywhere and fails only at link time,
-# on hardware nobody here has.
+# The intersectFunc/filterFunc definitions are prepended HERE rather than
+# emitted by codegen, and which side owns them depends on how HIP-RT is linked:
+#
+#   * This harness hand-links the device bitcode (-mlink-bitcode-file), which
+#     declares the hooks and leaves them undefined -- so the application must
+#     supply them or the link fails with `undefined hidden symbol`.
+#   * The backend compiles through hiprtBuildTraceKernels(), which GENERATES
+#     them and prepends them itself -- so an emitted definition is a duplicate
+#     and the build fails with "function has already been defined".
+#
+# Codegen targets the second, so the first is compensated for here. Getting
+# this backwards is invisible until whichever path you did not test is run.
 TRACE_BIN="${DRJIT_HIP_TRACE_BIN:-}"
 if [ -z "$TRACE_BIN" ]; then
     for c in "$(dirname "$0")/../../build-shim/tests/hip_trace" \
@@ -120,11 +128,16 @@ fi
 if [ -n "$TRACE_BIN" ] && [ -x "$TRACE_BIN" ]; then
     for mode in closest shadow; do
         arg=""; [ "$mode" = shadow ] && arg=shadow
-        src="/tmp/hip_trace_emitted_$mode.hip"
-        rm -f "$src"
+        raw="/tmp/hip_trace_emitted_$mode.hip"
+        src="/tmp/hip_trace_linkable_$mode.hip"
+        rm -f "$raw" "$src"
         # Not piped: the generator's exit status is the shape-check result.
-        if DRJIT_HIP_TRACE_OUT="$src" "$TRACE_BIN" $arg >/dev/null 2>&1 &&
-           [ -s "$src" ] &&
+        if DRJIT_HIP_TRACE_OUT="$raw" "$TRACE_BIN" $arg >/dev/null 2>&1 &&
+           [ -s "$raw" ] &&
+           { printf '#include <hiprt/hiprt_device.h>\n%s\n%s\n' \
+               '__device__ bool intersectFunc(unsigned, unsigned, const hiprtFuncTableHeader &, const hiprtRay &, void *, hiprtHit &) { return false; }' \
+               '__device__ bool filterFunc(unsigned, unsigned, const hiprtFuncTableHeader &, const hiprtRay &, void *, const hiprtHit &) { return false; }' \
+               > "$src"; cat "$raw" >> "$src"; } &&
            "$BIN" --no-exec "$src" >/dev/null 2>&1; then
             printf "  %-20s PASS  (emitted traversal links for gfx90a)\n" \
                    "trace_$mode"

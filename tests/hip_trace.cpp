@@ -59,14 +59,21 @@ static bool has(const std::string &s, const char *needle) {
 static void inspect(const char *ir) {
     std::string s(ir);
 
-    // The hooks HIP-RT requires at link time. Their absence is the failure
-    // mode that never shows up as a compile error in this process.
     check(has(s, "#include <hiprt/hiprt_device.h>"),
           "emits the HIP-RT device header");
-    check(has(s, "__device__ bool intersectFunc("),
-          "defines intersectFunc (HIP-RT declares, we must define)");
-    check(has(s, "__device__ bool filterFunc("),
-          "defines filterFunc");
+
+    // And deliberately NOT the intersectFunc / filterFunc definitions.
+    //
+    // hiprtBuildTraceKernels() -- the API the backend compiles through, on the
+    // shim and on real hardware alike -- generates those hooks itself and
+    // prepends them to the source, so an emitted definition is a duplicate and
+    // the build fails with "function has already been defined". Only a
+    // hand-rolled bitcode link needs the application to supply them, which is
+    // what run_tests.sh does for its gfx90a check.
+    check(!has(s, "__device__ bool intersectFunc("),
+          "does NOT define intersectFunc (hiprtBuildTraceKernels supplies it)");
+    check(!has(s, "__device__ bool filterFunc("),
+          "does NOT define filterFunc");
 
     // Traversal kind follows the shadow flag: any-hit terminates at the first
     // intersection, which is the only reason the flag is worth carrying.

@@ -772,7 +772,7 @@ Task *jitc_run(ThreadState *ts, ScheduledGroup group) {
             kernel.size = 1;
             kernel.data = nullptr;
             void *mod = nullptr;
-            std::tie(mod, cache_hit) = jitc_hip_compile(buffer.get());
+            std::tie(mod, cache_hit) = jitc_hip_compile(buffer.get(), kernel_name);
             kernel.cuda.mod = (CUmodule) mod;
         } else
 #endif

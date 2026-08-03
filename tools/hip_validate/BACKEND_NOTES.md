@@ -177,13 +177,32 @@ hipcc --offload-arch=gfx90a --genco --rocm-device-lib-path=$HIP_DEVICE_LIB_PATH 
       -Xclang -mlink-bitcode-file -Xclang <unbundled-gfx90a>.bc  kernel.hip
 ```
 
-**3. Every traversing kernel MUST define `intersectFunc` and `filterFunc`.**
-HIP-RT declares them and leaves the definitions to the application — the custom
--primitive intersection and any-hit filter hooks, analogous to Metal's
-intersection function table and OptiX's IS/AH programs. Omit them and the link
-fails with `undefined hidden symbol: intersectFunc(...)`. **The emitter must
-emit at least stubs into every kernel that traverses**, and dispatch through
-them for scenes with custom primitives. Nothing in §7 anticipated this.
+**3. Somebody must define `intersectFunc` and `filterFunc` — but not always
+us.** HIP-RT declares them and leaves the definitions to be supplied: they are
+the custom-primitive intersection and any-hit filter hooks, analogous to
+Metal's intersection function table and OptiX's IS/AH programs. Hand-link the
+device bitcode without them and the link fails with `undefined hidden symbol:
+intersectFunc(...)`.
+
+**CORRECTED in Phase 5 — the original conclusion here ("the emitter must emit
+at least stubs") was wrong, and wrong in the expensive direction.** Which side
+owns the definitions depends on how the traversal library is linked:
+
+| link route | who defines the hooks |
+|---|---|
+| hand-linked bitcode (`-Xclang -mlink-bitcode-file`) — what `hip_validate` does | the application |
+| `hiprtBuildTraceKernels()` — what the BACKEND uses, shim and hardware alike | HIP-RT, generated and prepended |
+
+Emitting stubs is therefore correct for this harness and *breaks* the backend:
+`hiprtBuildTraceKernels()` fails with `function "intersectFunc" has already
+been defined`, reported only as a bare `hiprtErrorInternal` from the API. So
+codegen emits the `#include` and nothing else, and `run_tests.sh` prepends the
+definitions itself before its hand-linked gfx90a compile.
+
+The finding generalises: **§7a's observations were made through the harness's
+link path, which is not the backend's.** Anything else recorded here about
+linking should be re-checked against `hiprtBuildTraceKernels()` before being
+built on.
 
 **4. `hiprtHit` does not carry a geometry ID or a user instance ID.** It has
 `hasHit()`, `t`, `uv.x`, `uv.y`, `primID`, `instanceID` (plus a geometric
@@ -797,9 +816,35 @@ hand-written minimal traversal, which is the check that the traversal really
 was linked in rather than optimised away.
 
 Exiting from a log callback is strange enough to read as a bug later, so it is
-commented at length in the test. It is not permanent: it goes away once the
-shim links the HIP-RT device library, at which point traced kernels can execute
-on NVIDIA the way `hiprt_triangle.cpp` already does (§7b).
+commented at length in the test.
+
+### And then the shim learned to run them
+
+`jitc_hip_compile()` now routes any kernel whose source contains the HIP-RT
+include through `hiprtBuildTraceKernels()` instead of bare NVRTC. That call
+compiles *and links* the traversal library, and on NVIDIA it drives NVRTC
+underneath — so `tests/hip_trace_exec.cpp` builds a real BVH, traces through
+`jit_hip_ray_trace()`, evaluates, and checks the hits: 32 lanes inside a
+triangle hit at t = 1.0, 32 outside miss, and `geometry_id` arrives from the
+instance-indexed table.
+
+Phase 5 is therefore emitted, linked for gfx90a, **and executed**. What is
+still owed to the MI210 is wave64 and the AMD host API — not traversal
+correctness, because gfx90a has no RT hardware and takes the same software path
+NVIDIA just ran (§7b).
+
+Two things this cost, both worth remembering:
+
+- **The stub correction above.** The end-to-end test is what surfaced it; the
+  emitted-source check could not, because it validates against the harness's
+  link path, which wants the opposite.
+- **`HIPRT_PATH` is read at context creation** and the dev shell points it at
+  the AMD build for `hip_validate`'s benefit. The shim overrides it to the
+  CUDA-enabled build before calling `hiprtCreateContext()`, or context creation
+  fails as `hiprtErrorInternal` with the missing filename visible only after
+  `hiprtSetLogLevel()` — which the shim now enables unconditionally, because it
+  costs nothing and is the difference between a five-minute fix and an
+  afternoon.
 
 ### `jitc_var_pointer()` takes a reference on its `dep`
 

@@ -47,8 +47,16 @@ extern void *jitc_hip_kernel(int device, const char *name);
 /// equivalent is hiprtc -> hipModuleLoadData; the call SHAPE is identical,
 /// which tools/hip_validate/hipnv_pipeline.cpp verifies against the real API.
 ///
+/// A kernel that RAY TRACES takes a different route: bare NVRTC cannot build
+/// it, because it includes <hiprt/hiprt_device.h> and has to be linked against
+/// HIP-RT's traversal library. Those go through hiprtBuildTraceKernels(), which
+/// does both -- and which exists with the same signature on real hardware, so
+/// the shape being exercised is the one the MI210 will use. `kernel_name` is
+/// needed because that call names its entry point.
+///
 /// Returns (module, cache_hit), matching jitc_cuda_compile().
-extern std::pair<void *, bool> jitc_hip_compile(const char *source);
+extern std::pair<void *, bool> jitc_hip_compile(const char *source,
+                                               const char *kernel_name);
 #endif
 
 // NOTE: jitc_hip_assemble / _reset / jitc_hip_format are declared in eval.h,

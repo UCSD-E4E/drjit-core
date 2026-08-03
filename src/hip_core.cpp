@@ -416,7 +416,134 @@ static bool jitc_hip_nvrtc_init() {
     return true;
 }
 
-std::pair<void *, bool> jitc_hip_compile(const char *source) {
+// ---------------------------------------------------------------------------
+//  Ray tracing under the shim
+// ---------------------------------------------------------------------------
+//
+// A generated kernel that traverses cannot go through bare NVRTC: it includes
+// <hiprt/hiprt_device.h> and must be LINKED against HIP-RT's traversal
+// library. hiprtBuildTraceKernels() does the compile and the link together,
+// and on NVIDIA it drives NVRTC underneath -- which is why this works at all
+// (BACKEND_NOTES §7b: HIP-RT supports NVIDIA through Orochi; only the stock
+// nixpkgs package disables it).
+//
+// This is shim-only. On real hardware the same call exists and takes the same
+// arguments, so the shape being exercised here is the shape the MI210 will use.
+
+#if defined(DRJIT_HIP_SHIM_HIPRT)
+
+#include <hiprt/hiprt.h>
+
+static hiprtContext jitc_hiprt_ctx = nullptr;
+
+/// Create the HIP-RT context on first use, against the current CUDA context.
+static bool jitc_hip_shim_rt_init() {
+    if (jitc_hiprt_ctx)
+        return true;
+
+    // HIP-RT locates its device libraries and precompiled builder kernels
+    // relative to $HIPRT_PATH. The dev shell points that at the AMD build (for
+    // hip_validate's gfx arm), so it has to be redirected here or context
+    // creation fails as hiprtErrorInternal -- with the missing filename
+    // visible only after hiprtSetLogLevel(), which is exactly the "fails late
+    // and unhelpfully" mode §7b warned about.
+    const char *want = DRJIT_HIP_SHIM_HIPRT_PATH;
+    const char *have = getenv("HIPRT_PATH");
+    if (!have || strcmp(have, want) != 0)
+        setenv("HIPRT_PATH", want, 1);
+
+    ThreadState *ts = thread_state(JitBackend::HIP);
+
+    hiprtContextCreationInput ci {};
+    ci.ctxt = (hiprtApiCtx) ts->context;
+    ci.device = (hiprtApiDevice) state.devices[ts->device].id;
+    ci.deviceType = hiprtDeviceNVIDIA;
+
+    hiprtError rv = hiprtCreateContext(HIPRT_API_VERSION, ci, jitc_hiprt_ctx);
+    if (rv != hiprtSuccess) {
+        jitc_hiprt_ctx = nullptr;
+        jitc_log(Warn,
+                 "jit_hip_compile(): hiprtCreateContext() failed (%d). Ray "
+                 "tracing is unavailable under the shim.", (int) rv);
+        return false;
+    }
+
+    // HIP-RT reports most build failures as a bare hiprtErrorInternal, and the
+    // actual cause -- usually a missing file, named -- only appears in its log
+    // (BACKEND_NOTES §7b). Turning that on costs nothing and is the difference
+    // between a five-minute fix and an afternoon.
+    hiprtSetLogLevel(jitc_hiprt_ctx,
+                     hiprtLogLevelInfo | hiprtLogLevelWarn | hiprtLogLevelError);
+
+    jitc_log(Info, "jit_hip_compile(): HIP-RT context created (shim, NVIDIA).");
+    return true;
+}
+
+/// Compile a traversing kernel through HIP-RT and return its CUmodule.
+static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
+                                                        const char *name) {
+    if (!jitc_hip_shim_rt_init())
+        jitc_raise("jit_hip_compile(): this kernel performs ray tracing, but "
+                   "the HIP-RT context could not be created.");
+
+    // NVRTC starts with an EMPTY include search list, so both the HIP-RT
+    // device headers and <cuda_fp16.h> have to be spelled out.
+    std::vector<std::string> opt_storage{
+        std::string("-I") + DRJIT_HIP_SHIM_HIPRT_PATH + "/include",
+        "--std=c++17"
+    };
+    const char *cuda_inc = getenv("DRJIT_HIP_SHIM_CUDA_INCLUDE");
+    if (cuda_inc && *cuda_inc) {
+        opt_storage.push_back(std::string("-I") + cuda_inc);
+        opt_storage.push_back("-DDRJIT_SHIM_HAVE_FP16=1");
+    }
+
+    std::vector<const char *> opts;
+    for (const std::string &s : opt_storage)
+        opts.push_back(s.c_str());
+
+    hiprtApiFunction func = nullptr;
+    hiprtApiModule mod = nullptr;
+    const char *names[1] = { name };
+
+    hiprtError rv = hiprtBuildTraceKernels(
+        jitc_hiprt_ctx, 1, names, source, name,
+        /* numHeaders = */ 0, nullptr, nullptr,
+        (uint32_t) opts.size(), opts.data(),
+        /* numGeomTypes = */ 0, /* numRayTypes = */ 0,
+        /* funcNameSets = */ nullptr, &func, &mod, /* cache = */ false);
+
+    if (rv != hiprtSuccess) {
+        jitc_log(Warn, "jit_hip_compile(): generated source that HIP-RT failed "
+                       "to build:\n%s", source);
+        jitc_fail("jit_hip_compile(): hiprtBuildTraceKernels() failed (%d).",
+                  (int) rv);
+    }
+
+    // `cache = false` above, so this is never a hit. HIP-RT has its own kernel
+    // cache; wiring drjit's on top of it would need the two to agree on a key,
+    // and the shim is not where that is worth doing.
+    return { (void *) mod, false };
+}
+
+#endif // DRJIT_HIP_SHIM_HIPRT
+
+std::pair<void *, bool> jitc_hip_compile(const char *source,
+                                         const char *kernel_name) {
+    // Does this kernel traverse? The emitted HIP-RT include is the marker, and
+    // it is emitted exactly when a TraceRay node is present.
+    if (strstr(source, "hiprt/hiprt_device.h")) {
+#if defined(DRJIT_HIP_SHIM_HIPRT)
+        return jitc_hip_shim_rt_compile(source, kernel_name);
+#else
+        jitc_raise("jit_hip_compile(): this kernel performs ray tracing, which "
+                   "under the CUDA shim needs a CUDA-enabled HIP-RT build. "
+                   "Configure with -DDRJIT_HIPRT_PATH=... (or set $HIPRT_NV_PATH "
+                   "before configuring). The stock HIP-RT package cannot target "
+                   "NVIDIA -- see the hipRtNv derivation in flake.nix.");
+#endif
+    }
+
     if (!jitc_hip_nvrtc_init())
         jitc_fail("jit_hip_compile(): NVRTC is unavailable.");
 
