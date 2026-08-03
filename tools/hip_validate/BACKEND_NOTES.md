@@ -186,11 +186,19 @@ emit at least stubs into every kernel that traverses**, and dispatch through
 them for scenes with custom primitives. Nothing in §7 anticipated this.
 
 **4. `hiprtHit` does not carry a geometry ID or a user instance ID.** It has
-`hasHit()`, `t`, `uv.x`, `uv.y`, `primID`, `instanceID` — six of Metal's eight
-outputs. `geometry_id` and `user_instance_id` have to be reconstructed
-application-side (an indexed table, most likely). This is a **contract
-difference**, so §7's "adopt `jit_metal_ray_trace`'s signature verbatim" needs
-qualifying before the interface is fixed.
+`hasHit()`, `t`, `uv.x`, `uv.y`, `primID`, `instanceID` (plus a geometric
+normal Metal does not give) — six of Metal's eight outputs. `geometry_id` and
+`user_instance_id` have to be reconstructed application-side.
+
+**Resolved in Phase 5, and the signature did NOT need qualifying after all.**
+Both missing outputs are supplied by device tables indexed by the hit's
+instance ID, passed to `jit_hip_configure_scene()`. That is exact rather than a
+workaround: **a HIP-RT instance references exactly one geometry**, so "which
+geometry was hit" genuinely is a property of the instance. Metal needs a
+per-hit field because its acceleration structures nest several geometries
+inside one instance; the difference is in the scene model, not in the fidelity
+of the answer. `jit_hip_ray_trace` is therefore byte-for-byte
+`jit_metal_ray_trace`'s signature, which is what makes Layer C cheap.
 
 **5. Traversal costs 64 VGPR / 38 AGPR / 54 SGPR / 800 B scratch** on gfx90a
 for a minimal closest-hit scene traversal. HIP-RT keeps its stack in scratch,
@@ -755,6 +763,66 @@ packet one: the generic answers permit `Float16` atomics, while
 correct lowering). Capability tables that over-promise turn a graceful fallback
 into an abort halfway through codegen. It now says no, and the packed `f16x2`
 treatment stays on the Phase 4 remainder list.
+
+## 11i. Phase 5 — validating an emitter you cannot execute
+
+Ray tracing had a validation problem the other phases did not. The generated
+kernel `#include`s `<hiprt/hiprt_device.h>`, which the CUDA shim's NVRTC cannot
+find, so `jit_var_eval()` on a traced graph aborts before anything runs. The
+usual end-to-end check is unavailable.
+
+The resolution is to validate the **emitted text** rather than the emitter's
+effects, and to do it against the real target:
+
+1. `tests/hip_trace.cpp` sets `JitFlag::PrintIR` and installs a log callback.
+   Codegen routes the assembled source through it *before* handing it to the
+   compiler, so the callback sees the genuine artifact.
+2. The callback asserts the structural properties — the HIP-RT include, both
+   hook definitions, `...TraversalAnyHit` for shadow versus `...Closest`
+   otherwise, the five hit fields, the two table lookups — writes the source
+   out, and **exits from inside the callback**, because the compile that
+   follows aborts the process via `jitc_fail()` rather than throwing.
+3. `run_tests.sh` compiles that file for real `gfx90a` with the HIP-RT device
+   library linked.
+
+Step 3 is the one that matters. HIP-RT declares `intersectFunc` / `filterFunc`
+and leaves the definitions to the application (§7a finding 3), so a backend
+that omits them emits source that compiles cleanly on every platform anyone
+here has and fails at **link** time on hardware nobody here has. Nothing short
+of a real gfx90a link catches that.
+
+Measured footprint of the emitted closest-hit traversal: 64 VGPR / 38 AGPR /
+54 SGPR / 784 B scratch — within noise of the 800 B §7a measured for a
+hand-written minimal traversal, which is the check that the traversal really
+was linked in rather than optimised away.
+
+Exiting from a log callback is strange enough to read as a bug later, so it is
+commented at length in the test. It is not permanent: it goes away once the
+shim links the HIP-RT device library, at which point traced kernels can execute
+on NVIDIA the way `hiprt_triangle.cpp` already does (§7b).
+
+### `jitc_var_pointer()` takes a reference on its `dep`
+
+Worth its own heading, because the failure is silent in every direction.
+
+`HIPScene` caches the pointer variables it hands the emitter, so that several
+traces against one scene share a kernel parameter. The obvious `dep` for those
+handles is the scene variable — and it closes a cycle: the scene owns the
+handle, the handle references the scene, the reference count never reaches
+zero, the cleanup callback never fires, and the application waits forever for
+permission to free its BVH. Nothing errors. Nothing shows up as a leak at
+`jit_shutdown()`, because from drjit's point of view the variable is still
+legitimately alive.
+
+The right `dep` here is **0**. That argument exists to keep a *drjit
+allocation* alive while a pointer to it is in flight; a `hiprtScene` and the
+two ID tables are the application's memory, and their lifetime is exactly what
+the cleanup callback is for.
+
+`tests/hip_trace.cpp` checks this directly — configure a scene, issue a trace so
+the handles are actually created, drop the reference, assert the callback ran.
+Verified by reinstating the cycle and watching it fail. Any future per-scene
+resource cached this way needs the same treatment.
 
 ## 12. Suggested implementation order
 

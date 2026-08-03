@@ -196,7 +196,10 @@ if (DRJIT_ENABLE_HIP)
 
   set(DRJIT_HIP_FILES
     ${DRJIT_HIP_KERNELS}
+    include/drjit-core/hip.h
     src/hip.h
+    src/hip_scene.h
+    src/hip_scene.cpp
     src/hip_api.h
     src/hip_api.cpp
     src/hip_ts.h

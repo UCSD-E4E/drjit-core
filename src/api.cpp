@@ -44,6 +44,11 @@
 #  include "metal_tex.h"
 #endif
 
+#include <drjit-core/hip.h>
+#if defined(DRJIT_ENABLE_HIP)
+#  include "hip_scene.h"
+#endif
+
 #include <nanothread/nanothread.h>
 
 void jit_init(uint32_t backends) {
@@ -567,6 +572,60 @@ void jit_metal_scene_set_cleanup(uint32_t scene_index,
     scene->cleanup_payload = payload;
 #else
     (void) scene_index; (void) callback; (void) payload;
+#endif
+}
+
+// --- HIP ray tracing (drjit-core/hip.h) -------------------------------------
+
+uint32_t jit_hip_configure_scene(void *scene, void *func_table,
+                                 const void *geometry_ids,
+                                 const void *user_instance_ids,
+                                 uint32_t geometry_types_mask) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_HIP)
+    return jitc_hip_configure_scene(scene, func_table, geometry_ids,
+                                    user_instance_ids, geometry_types_mask);
+#else
+    (void) scene; (void) func_table; (void) geometry_ids;
+    (void) user_instance_ids; (void) geometry_types_mask;
+    jit_raise("jit_hip_configure_scene(): HIP backend not enabled.");
+    return 0;
+#endif
+}
+
+void jit_hip_ray_trace(uint32_t n_args, uint32_t *args, uint32_t mask,
+                       uint32_t *out, uint32_t n_out, uint32_t scene,
+                       int shadow) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_HIP)
+    jitc_hip_ray_trace(n_args, args, mask, out, n_out, scene, shadow);
+#else
+    (void) n_args; (void) args; (void) mask; (void) out; (void) n_out;
+    (void) scene; (void) shadow;
+    jit_raise("jit_hip_ray_trace(): HIP backend not enabled.");
+#endif
+}
+
+void jit_hip_scene_set_cleanup(uint32_t scene_index, void (*callback)(void *),
+                               void *payload) {
+#if defined(DRJIT_ENABLE_HIP)
+    lock_guard guard(state.lock);
+    HIPScene *scene = jitc_hip_get_scene(scene_index);
+    scene->cleanup = callback;
+    scene->cleanup_payload = payload;
+#else
+    (void) scene_index; (void) callback; (void) payload;
+#endif
+}
+
+uint32_t jit_hip_scene_owner_handle(uint32_t scene_index) {
+#if defined(DRJIT_ENABLE_HIP)
+    lock_guard guard(state.lock);
+    return jitc_hip_scene_owner_handle(scene_index);
+#else
+    (void) scene_index;
+    jit_raise("jit_hip_scene_owner_handle(): HIP backend not enabled.");
+    return 0;
 #endif
 }
 

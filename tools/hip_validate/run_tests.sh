@@ -99,6 +99,44 @@ if [ -n "${HIPNV_CFLAGS:-}" ] && command -v nvcc >/dev/null 2>&1; then
   fi
 fi
 
+# --- The EMITTED traversal, compiled for gfx90a (PLAN.md Phase 5) -----------
+#
+# spec_trace.hip checks a hand-written traversal. This checks the one codegen
+# actually produces: tests/hip_trace writes the assembled kernel out, and it is
+# compiled and LINKED here for real gfx90a.
+#
+# The link is the point. HIP-RT declares intersectFunc/filterFunc and leaves the
+# definitions to the application, so a backend that forgets to emit them
+# produces source that compiles cleanly everywhere and fails only at link time,
+# on hardware nobody here has.
+TRACE_BIN="${DRJIT_HIP_TRACE_BIN:-}"
+if [ -z "$TRACE_BIN" ]; then
+    for c in "$(dirname "$0")/../../build-shim/tests/hip_trace" \
+             "$(dirname "$0")/../../build-wiring/tests/hip_trace"; do
+        [ -x "$c" ] && { TRACE_BIN="$c"; break; }
+    done
+fi
+
+if [ -n "$TRACE_BIN" ] && [ -x "$TRACE_BIN" ]; then
+    for mode in closest shadow; do
+        arg=""; [ "$mode" = shadow ] && arg=shadow
+        src="/tmp/hip_trace_emitted_$mode.hip"
+        rm -f "$src"
+        # Not piped: the generator's exit status is the shape-check result.
+        if DRJIT_HIP_TRACE_OUT="$src" "$TRACE_BIN" $arg >/dev/null 2>&1 &&
+           [ -s "$src" ] &&
+           "$BIN" --no-exec "$src" >/dev/null 2>&1; then
+            printf "  %-20s PASS  (emitted traversal links for gfx90a)\n" \
+                   "trace_$mode"
+            pass=$((pass+1))
+        else
+            printf "  %-20s FAIL  (emitted traversal does not build)\n" \
+                   "trace_$mode"
+            fail=$((fail+1))
+        fi
+    done
+fi
+
 # --- HIP-RT traversal, actually executed (BACKEND_NOTES §7a) ----------------
 #
 # Needs $HIPRT_NV_PATH: the CUDA-enabled HIP-RT build, which the stock nixpkgs

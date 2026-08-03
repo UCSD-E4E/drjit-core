@@ -145,6 +145,23 @@ if (DRJIT_ENABLE_HIP)
   # Skips rather than fails when the backend is inert (a default Phase 0a
   # build), so an untouched configuration does not look broken.
   set_tests_properties(hip_codegen PROPERTIES SKIP_RETURN_CODE 77)
+
+  # Phase 5: what the ray-tracing emitter actually produces. Runs twice --
+  # closest-hit and shadow select different HIP-RT traversal objects, and
+  # emitting the wrong one is invisible until a render comes back wrong.
+  #
+  # $DRJIT_HIP_TRACE_OUT makes it write the emitted source out; run_tests.sh
+  # sets that and then compiles the result for real gfx90a, which is the only
+  # place the HIP-RT link requirement gets checked.
+  add_executable(hip_trace hip_trace.cpp)
+  set_property(TARGET hip_trace PROPERTY CXX_STANDARD 17)
+  target_link_libraries(hip_trace PRIVATE drjit-core)
+  add_test(NAME hip_trace COMMAND hip_trace
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(NAME hip_trace_shadow COMMAND hip_trace shadow
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
+  set_tests_properties(hip_trace hip_trace_shadow
+                       PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 add_executable(microbenchmark microbenchmark.cpp)

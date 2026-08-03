@@ -6,13 +6,18 @@
 // #  THIS KERNEL CANNOT BE EXECUTED HERE, AND THAT IS NOT A HARNESS GAP.     #
 // ############################################################################
 //
-// HIP-RT as packaged ships device libraries for AMD targets only
-// (hiprt*_amd_lib_linux.bc, hiprt*_amd.hipfb) and its host library dlopens
-// libamdhip64 / libhiprtc with no CUDA driver paths. The API has a
-// hiprtDeviceNVIDIA enum value, but this build cannot service it. So unlike
-// every other specimen, there is no execution arm: `hiprt` in the source makes
-// hip_validate link the HIP-RT device library and compile for gfx90a, and the
-// NVIDIA arm is skipped.
+// hip_validate's execution arm is plain NVRTC with no HIP-RT linked, so there
+// is nothing here to run a traversal against. `hiprt` in the source makes the
+// harness link the HIP-RT device library and compile for gfx90a, and skip the
+// NVIDIA arm.
+//
+// An earlier version of this note claimed traversal was unverifiable off AMD
+// hardware because "HIP-RT ships AMD-only device libraries". That was true of
+// the nixpkgs PACKAGE and false of HIP-RT, which supports NVIDIA through
+// Orochi. flake.nix now builds a CUDA-enabled `hipRtNv`, and
+// tools/hip_validate/hiprt_triangle.cpp builds a BVH and traverses it on the
+// local NVIDIA GPU with verified hits (BACKEND_NOTES §7b). Traversal
+// CORRECTNESS is covered there; this file covers the gfx90a compile and link.
 //
 // What that DOES establish, and it is the bulk of the Phase 0b risk:
 //
@@ -26,9 +31,11 @@
 //      scratch, so a shape change that doubles it still compiles and still
 //      runs, and shows up as halved throughput on the MI210 much later.
 //
-// What remains UNVERIFIABLE until an MI210 is present: whether traversal
-// returns correct hits. Treat this file the way run_tests.sh treats the wave64
-// list -- structure confirmed, semantics pending hardware.
+// What remains UNVERIFIED until an MI210 is present: whether traversal returns
+// correct hits ON gfx90a specifically -- wave64, and AMD's own traversal path.
+// Structure confirmed here, correctness confirmed on NVIDIA by hiprt_triangle,
+// and gfx90a takes HIP-RT's RTIP 0 SOFTWARE path (it has no RT hardware), which
+// is what makes that proxy worth having rather than a curiosity.
 //
 // ---------------------------------------------------------------------------
 //  The output contract
@@ -38,10 +45,23 @@
 // primitive_id, geometry_id, user_instance_id) and BACKEND_NOTES §7 proposes
 // carrying that contract over verbatim. hiprtHit supplies five of them
 // directly -- hasHit(), t, uv.x, uv.y, primID, instanceID -- and notably does
-// NOT carry a geometry ID or a user instance ID. Those two have to come from
-// somewhere else (an application-side table indexed by instanceID, most
-// likely). Recorded here because it is a contract difference, not an
-// implementation detail, and it is cheaper to discover now than mid-port.
+// NOT carry a geometry ID or a user instance ID.
+//
+// RESOLVED in Phase 5, and the contract did not have to change: both come from
+// device tables indexed by hit.instanceID, supplied to jit_hip_configure_scene.
+// That is exact rather than a workaround -- a HIP-RT instance references
+// exactly one geometry, so "which geometry was hit" really is a property of the
+// instance. So jit_hip_ray_trace IS jit_metal_ray_trace's signature.
+//
+// ---------------------------------------------------------------------------
+//  This file vs. the emitted traversal
+// ---------------------------------------------------------------------------
+//
+// This is a HAND-WRITTEN traversal, so it says nothing about what codegen
+// produces. tests/hip_trace.cpp captures the real emitted source and
+// run_tests.sh compiles THAT for gfx90a as well ("trace_closest" /
+// "trace_shadow"). Keep both: this one is the cheap place to try a shape before
+// teaching the emitter to produce it.
 
 #include <hip/hip_runtime.h>
 #include <hiprt/hiprt_device.h>

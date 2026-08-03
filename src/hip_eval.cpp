@@ -29,6 +29,7 @@
 #include "loop.h"        // LoopData
 #include "cond.h"        // CondData, jitc_cond_output_active
 #include "op.h"          // ScatterCASDData
+#include "trace.h"       // TraceData
 #include <cstring>
 #include "hip.h"
 #include "hip_eval.h"
@@ -36,6 +37,7 @@
 #include "hip_literal.h"
 #include "hip_prologue.h"
 #include "hip_array.h"
+#include "hip_scene.h"
 
 // MUST BE LAST. This redefines `fmt` and `put` as macros, which would otherwise
 // mangle StringBuffer's own put() member declarations in strbuf.h. metal_eval.cpp
@@ -375,6 +377,164 @@ static void render_scatter_packet(Variable *v, Variable *ptr, Variable *index,
     put("}\n");
 }
 
+// ---------------------------------------------------------------------------
+//  Ray tracing (HIP-RT)
+// ---------------------------------------------------------------------------
+
+/// Register the HIP-RT include and the two hook definitions HIP-RT requires.
+///
+/// This is not boilerplate that could be dropped. HIP-RT DECLARES
+/// `intersectFunc` and `filterFunc` -- the custom-primitive intersection and
+/// any-hit filter hooks, its analogue of Metal's intersection function table --
+/// and leaves the definitions to the application. A kernel that traverses
+/// without them does not fail at run time; it fails to LINK, with
+/// `undefined hidden symbol: intersectFunc(...)`. Discovered by the Phase 0b
+/// spike (BACKEND_NOTES §7a finding 3), which is the only reason it is here
+/// rather than a week into integration.
+///
+/// Registration dedups by content, so a kernel with a hundred traces emits one
+/// copy, and the globals machinery places it ahead of the kernel body.
+static void jitc_hip_emit_trace_preamble(const HIPScene *scene) {
+    size_t off = buffer.size();
+    put("#include <hiprt/hiprt_device.h>\n");
+    jitc_register_global(buffer.get() + off);
+    buffer.rewind_to(off);
+
+    // A function table means the scene has custom primitives, and HIP-RT
+    // dispatches through these hooks to intersect them. Forwarding is not
+    // implemented, and stubbing it would report a miss for every custom shape
+    // -- a black object in a render, a very long way from its cause. Fail here
+    // instead, at the moment the offending scene is used.
+    if (scene && scene->func_table)
+        jitc_raise("jitc_hip_render(): this scene was configured with a "
+                   "hiprtFuncTable, but custom-primitive intersection "
+                   "functions are not implemented (PLAN.md Phase 5). Build the "
+                   "scene without one, or implement the dispatch in "
+                   "jitc_hip_emit_trace_preamble().");
+
+    // No custom primitives: these stubs are the correct implementation, not a
+    // placeholder. `intersectFunc` reporting no hit means "this geometry has no
+    // custom intersector", and `filterFunc` returning false means "do not
+    // reject this hit".
+    off = buffer.size();
+    put("__device__ bool intersectFunc(unsigned, unsigned,\n"
+        "                              const hiprtFuncTableHeader &,\n"
+        "                              const hiprtRay &, void *,\n"
+        "                              hiprtHit &) { return false; }\n"
+        "__device__ bool filterFunc(unsigned, unsigned,\n"
+        "                           const hiprtFuncTableHeader &,\n"
+        "                           const hiprtRay &, void *,\n"
+        "                           const hiprtHit &) { return false; }\n");
+    jitc_register_global(buffer.get() + off);
+    buffer.rewind_to(off);
+}
+
+/// Emit a HIP-RT traversal.
+///
+/// The structure is Metal's (BACKEND_NOTES §7), and deliberately so: declare
+/// all eight outputs at their MISS values, guard the traversal with the mask,
+/// and let the hit path overwrite. Masked-off and missed lanes then fall
+/// through with correct values and no separate clearing pass.
+///
+/// Two HIP-RT specifics:
+///
+///   * `hiprtHit` carries no geometry ID and no user instance ID -- six of the
+///     eight outputs. The other two are read from instance-indexed tables
+///     supplied by jit_hip_configure_scene(), which is exact rather than a
+///     workaround: a HIP-RT instance references exactly one geometry, so both
+///     really are properties of the instance (see hip_scene.h).
+///
+///   * The mask guards the whole traversal rather than selecting on its result.
+///     An unmasked traversal against a scene the lane was not meant to touch is
+///     not wasted work, it is a fault.
+static void render_trace_ray(Variable *v) {
+    TraceData *td = (TraceData *) v->data;
+    Variable *valid = jitc_var(v->dep[0]);
+    HIPScene *scene = (HIPScene *) (uintptr_t) jitc_var(v->dep[1])->literal;
+    bool is_unmasked = valid->is_literal() && valid->literal == 1;
+
+    jitc_hip_emit_trace_preamble(scene);
+
+    // Miss values. +inf via its bit pattern rather than a literal, so nothing
+    // depends on how the downstream compiler parses `INFINITY`.
+    if (td->shadow) {
+        fmt("bool $v_out_0 = false;\n", v);
+    } else {
+        fmt("bool $v_out_0 = false;\n"
+            "f32 $v_out_1 = __uint_as_float(0x7f800000u);\n"
+            "f32 $v_out_2 = 0.0f;\n"
+            "f32 $v_out_3 = 0.0f;\n"
+            "u32 $v_out_4 = 0u;\n"
+            "u32 $v_out_5 = 0u;\n"
+            "u32 $v_out_6 = 0u;\n"
+            "u32 $v_out_7 = 0u;\n",
+            v, v, v, v, v, v, v, v);
+    }
+
+    if (!is_unmasked)
+        fmt("if ($v) {\n", valid);
+    else
+        put("{\n");
+
+    Variable *ox   = jitc_var(td->indices[0]),
+             *oy   = jitc_var(td->indices[1]),
+             *oz   = jitc_var(td->indices[2]),
+             *dx   = jitc_var(td->indices[3]),
+             *dy   = jitc_var(td->indices[4]),
+             *dz   = jitc_var(td->indices[5]),
+             *tmin = jitc_var(td->indices[6]),
+             *tmax = jitc_var(td->indices[7]);
+
+    fmt("    hiprtRay _r;\n"
+        "    _r.origin    = { $v, $v, $v };\n"
+        "    _r.direction = { $v, $v, $v };\n"
+        "    _r.minT      = $v;\n"
+        "    _r.maxT      = $v;\n",
+        ox, oy, oz, dx, dy, dz, tmin, tmax);
+
+    // Shadow rays take the AnyHit traversal, which is what makes the `shadow`
+    // flag worth having: it terminates at the first hit rather than sorting.
+    const char *traversal = td->shadow ? "hiprtSceneTraversalAnyHit"
+                                       : "hiprtSceneTraversalClosest";
+
+    Variable *scene_h = jitc_var(scene->scene_handle);
+    if (scene->func_table_handle) {
+        fmt("    $s _tr((hiprtScene) $v, _r, hiprtFullRayMask,\n"
+            "           hiprtTraversalHintDefault, nullptr,\n"
+            "           (hiprtFuncTable) $v);\n",
+            traversal, scene_h, jitc_var(scene->func_table_handle));
+    } else {
+        fmt("    $s _tr((hiprtScene) $v, _r);\n", traversal, scene_h);
+    }
+
+    put("    hiprtHit _h = _tr.getNextHit();\n"
+        "    if (_h.hasHit()) {\n");
+
+    if (td->shadow) {
+        fmt("        $v_out_0 = true;\n", v);
+    } else {
+        fmt("        $v_out_0 = true;\n"
+            "        $v_out_1 = _h.t;\n"
+            "        $v_out_2 = _h.uv.x;\n"
+            "        $v_out_3 = _h.uv.y;\n"
+            "        $v_out_4 = _h.instanceID;\n"
+            "        $v_out_5 = _h.primID;\n",
+            v, v, v, v, v, v);
+
+        // The two outputs hiprtHit does not carry. Absent a table the answer is
+        // 0, which is also what a single-geometry scene would report.
+        if (scene->geometry_ids_handle)
+            fmt("        $v_out_6 = ((const u32 *) $v)[_h.instanceID];\n",
+                v, jitc_var(scene->geometry_ids_handle));
+        if (scene->user_instance_ids_handle)
+            fmt("        $v_out_7 = ((const u32 *) $v)[_h.instanceID];\n",
+                v, jitc_var(scene->user_instance_ids_handle));
+    }
+
+    put("    }\n"
+        "}\n");
+}
+
 /// Emit a math call, choosing the double or float spelling by operand type.
 /// `base` is the double name; the float form is `base` + "f".
 static void render_math(Variable *v, const char *base, uint32_t n_args = 1) {
@@ -675,6 +835,10 @@ static void jitc_hip_render(Variable *v) {
             break;
         }
 
+        case VarKind::TraceRay:
+            render_trace_ray(v);
+            break;
+
         case VarKind::PacketGather:
             render_gather_packet(v, jitc_var(v->dep[0]), jitc_var(v->dep[1]),
                                  jitc_var(v->dep[2]));
@@ -829,11 +993,12 @@ static void jitc_hip_render(Variable *v) {
             Variable *src = jitc_var(v->dep[0]);
             uint32_t sub_index = (uint32_t) v->literal;
 
-            // ScatterCAS and PacketGather are the multi-output ops this backend
-            // emits so far; TraceRay / TexLookup land in the default case and
-            // say so explicitly rather than silently extracting field 0.
+            // The multi-output ops this backend emits. TexLookup lands in the
+            // default case and says so explicitly rather than silently
+            // extracting field 0.
             if ((VarKind) src->kind == VarKind::ScatterCAS ||
-                (VarKind) src->kind == VarKind::PacketGather)
+                (VarKind) src->kind == VarKind::PacketGather ||
+                (VarKind) src->kind == VarKind::TraceRay)
                 fmt("$t $v = $v_out_$u;\n", v, v, src, sub_index);
             else
                 fmt("$t $v = $v; // extract[$u]\n", v, v, src, sub_index);
