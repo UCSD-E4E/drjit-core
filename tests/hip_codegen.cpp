@@ -147,7 +147,12 @@ int main(int, char **) {
         // folding into the producing expression.
         jit_var_eval(src);
 
-        uint32_t g = jit_var_gather(src, rev, jit_var_bool(JitBackend::HIP, true));
+        // Held in a named variable rather than passed inline: jit_var_gather
+        // borrows its mask, so an inline temporary is never released and shows
+        // up as a leak at shutdown -- noise that makes a real leak harder to see.
+        uint32_t gmask = jit_var_bool(JitBackend::HIP, true);
+        uint32_t g = jit_var_gather(src, rev, gmask);
+        jit_var_dec_ref(gmask);
 
         jit_var_eval(g);
         void *gp = nullptr;
@@ -166,23 +171,173 @@ int main(int, char **) {
         jit_var_dec_ref(rev); jit_var_dec_ref(g);   jit_var_dec_ref(g_eval);
     }
 
-    // ---- Control flow: NOT YET VERIFIED --------------------------------------
+    // ---- Packet memory --------------------------------------------------------
+    //
+    // A packet gather/scatter moves `P` contiguous elements per lane. The two
+    // halves scale their index differently -- op.cpp pre-multiplies the SCATTER
+    // index by P and not the gather index -- so a backend that treats them
+    // alike compiles and then reads or writes the wrong packet. That is
+    // invisible in a round trip through a single opcode, hence the gather and
+    // the scatter are checked against independently computed expectations here
+    // rather than against each other.
+    {
+        constexpr uint32_t P = 4, NP = N / P;   // NP packets of P elements
+
+        // src[i] = i, viewed as NP packets
+        uint32_t src = jit_var_counter(JitBackend::HIP, N);
+        jit_var_eval(src);
+
+        uint32_t pidx = jit_var_counter(JitBackend::HIP, NP),
+                 pm   = jit_var_bool(JitBackend::HIP, true);
+
+        uint32_t got[P];
+        jit_var_gather_packet(P, src, pidx, pm, got);
+
+        // Element `k` of packet `p` must be p*P + k.
+        bool ok = true;
+        for (uint32_t k = 0; k < P; ++k) {
+            jit_var_eval(got[k]);
+            void *p = nullptr;
+            uint32_t ev = jit_var_data(got[k], &p);
+
+            uint32_t host[NP];
+            jit_memcpy(JitBackend::HIP, host, p, sizeof(host));
+            for (uint32_t i = 0; i < NP; ++i)
+                ok &= (host[i] == i * P + k);
+            jit_var_dec_ref(ev);
+        }
+        check(ok, "packet gather reads the right packet for all lanes");
+
+        // Scatter the same values back, reversed within each packet, into a
+        // fresh buffer. Reversal makes an element-order mistake visible.
+        uint32_t sentinel = 0xdeadbeefu;
+        uint32_t dst = jit_var_literal(JitBackend::HIP, VarType::UInt32,
+                                       &sentinel, N, /* eval = */ 1);
+
+        uint32_t vals[P];
+        for (uint32_t k = 0; k < P; ++k)
+            vals[k] = got[P - 1 - k];
+
+        uint32_t dst2 = jit_var_scatter_packet(P, dst, vals, pidx, pm);
+        jit_var_eval(dst2);
+
+        void *dp = nullptr;
+        uint32_t dst_eval = jit_var_data(dst2, &dp);
+        uint32_t hostd[N];
+        jit_memcpy(JitBackend::HIP, hostd, dp, sizeof(hostd));
+
+        bool ok2 = true;
+        for (uint32_t i = 0; i < NP; ++i)
+            for (uint32_t k = 0; k < P; ++k)
+                ok2 &= (hostd[i * P + k] == i * P + (P - 1 - k));
+        check(ok2, "packet scatter writes the right packet for all lanes");
+
+        // Packet scatter-REDUCE.
+        //
+        // Note what this does and does not reach. op.cpp's `use_packet_op`
+        // selection has arms for LLVM, CUDA and Metal and none for HIP, so a
+        // non-Identity packet scatter DECOMPOSES into scalar scatter-reduces
+        // here -- render_scatter_packet()'s reduce branch is not entered. That
+        // is deliberate (see the comment at that site); what this check is
+        // worth is that the decomposition itself is correct on HIP.
+        //
+        // Float32 Min: HIP has no atomicMin for floats, so each scalar reduce
+        // goes through render_scatter_reduce()'s compare-and-swap loop. An
+        // integer Add would exercise only the native-atomic path. (ReduceOp::Mul
+        // never arrives at all -- jitc_can_scatter_reduce() rejects it for every
+        // backend.)
+        //
+        // One lane per packet, so the result is contention-free and exact.
+        float big = 1e9f;
+        uint32_t rdst = jit_var_literal(JitBackend::HIP, VarType::Float32,
+                                        &big, N, /* eval = */ 1);
+
+        uint32_t rvals[P];
+        for (uint32_t k = 0; k < P; ++k)
+            rvals[k] = jit_var_f32(JitBackend::HIP, (float) (3 + k));
+
+        uint32_t rdst2 = jit_var_scatter_packet(P, rdst, rvals, pidx, pm,
+                                                ReduceOp::Min);
+        jit_var_eval(rdst2);
+
+        void *rp = nullptr;
+        uint32_t rdst_eval = jit_var_data(rdst2, &rp);
+        float hostr[N];
+        jit_memcpy(JitBackend::HIP, hostr, rp, sizeof(hostr));
+
+        bool ok3 = true;
+        for (uint32_t i = 0; i < NP; ++i)
+            for (uint32_t k = 0; k < P; ++k)
+                ok3 &= (hostr[i * P + k] == (float) (3 + k));
+        check(ok3, "packet scatter-reduce correct (decomposed to scalar CAS)");
+
+        for (uint32_t k = 0; k < P; ++k) {
+            jit_var_dec_ref(got[k]);
+            jit_var_dec_ref(rvals[k]);
+        }
+        jit_var_dec_ref(src);  jit_var_dec_ref(pidx);  jit_var_dec_ref(pm);
+        jit_var_dec_ref(dst);  jit_var_dec_ref(dst2);  jit_var_dec_ref(dst_eval);
+        jit_var_dec_ref(rdst); jit_var_dec_ref(rdst2); jit_var_dec_ref(rdst_eval);
+    }
+
+    // ---- Debug-mode bounds check ---------------------------------------------
+    //
+    // BoundsCheck is emitted only under JitFlag::Debug, so nothing above
+    // reaches it -- and a backend that raises on it makes debug mode, the one
+    // setting that would explain a wrong answer, the one setting that cannot
+    // run. Hence a dedicated section.
+    //
+    // The opcode returns the incoming MASK with out-of-bounds lanes cleared,
+    // which is what the gather is predicated on. A backend that returned the
+    // raw comparison instead would enable lanes the caller had masked off; a
+    // backend that ignored the check would read past the buffer. Both show up
+    // as a wrong value in the second half of `hostb` below.
+    {
+        int debug_before = jit_flag(JitFlag::Debug);
+        jit_set_flag(JitFlag::Debug, 1);
+
+        constexpr uint32_t M = 16;   // source is half as long as the index range
+        uint32_t src = jit_var_counter(JitBackend::HIP, M);   // 0..M-1
+        jit_var_eval(src);
+
+        // Indices 0..N-1 against a source of length M: the tail is out of
+        // bounds and must come back as 0 rather than garbage.
+        uint32_t idx  = jit_var_counter(JitBackend::HIP, N),
+                 mask = jit_var_bool(JitBackend::HIP, true);
+
+        uint32_t g = jit_var_gather(src, idx, mask);
+        jit_var_eval(g);
+
+        void *bp = nullptr;
+        uint32_t g_eval = jit_var_data(g, &bp);
+
+        uint32_t hostb[N];
+        jit_memcpy(JitBackend::HIP, hostb, bp, sizeof(hostb));
+
+        bool ok = true;
+        for (uint32_t i = 0; i < N; ++i)
+            ok &= (hostb[i] == (i < M ? i : 0u));
+        check(ok, "debug bounds check masks the out-of-range tail");
+
+        jit_var_dec_ref(src); jit_var_dec_ref(idx); jit_var_dec_ref(mask);
+        jit_var_dec_ref(g);   jit_var_dec_ref(g_eval);
+
+        jit_set_flag(JitFlag::Debug, debug_before);
+    }
+
+    // ---- Control flow is covered elsewhere, on purpose ------------------------
     //
     // jitc_hip_render() implements LoopStart/Cond/End/Phi/Output and
-    // CondStart/Mid/End, ported closely from metal_eval.cpp, and it compiles.
-    // It is NOT exercised here.
+    // CondStart/Mid/End. It is NOT exercised here, and should not be: a
+    // hand-rolled symbolic loop was attempted and removed, because
+    // jit_var_loop_end() needs a jit_record_begin() checkpoint and may return
+    // 0, requiring the body to be recorded a second time. Getting that protocol
+    // subtly wrong produces a test that fails for reasons unrelated to codegen,
+    // which is worse than no test -- it points at the wrong suspect.
     //
-    // A hand-rolled symbolic loop was attempted and removed: jit_var_loop_end()
-    // requires a jit_record_begin() checkpoint and may return 0, meaning the
-    // body must be recorded a second time after Dr.Jit simplifies the state.
-    // Getting that protocol subtly wrong produces a test that fails for reasons
-    // unrelated to codegen -- which is worse than no test, because it points at
-    // the wrong suspect.
-    //
-    // The right coverage is to register HIP with the TEST_* macros in
-    // tests/test.h so the existing test_loop / test_vcall suites run against
-    // this backend, rather than reimplementing their protocol by hand. Until
-    // then, treat control flow as WRITTEN BUT UNVERIFIED.
+    // HIP is instead registered with the TEST_* macros in tests/test.h, so the
+    // upstream test_loop / test_vcall / test_record suites run against this
+    // backend directly. They pass 9/9, 14/14 and 9/9.
 
     jit_shutdown(0);
 

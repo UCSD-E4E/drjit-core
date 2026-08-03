@@ -657,6 +657,105 @@ Two independent checks, because neither alone is enough:
 Both run at width 32. Neither says anything about wave64, which is the point of
 carrying the width as a parameter rather than fixing it.
 
+## 11h. Phase 4 — what turned out not to be work
+
+The remaining opcode gap after Phase 3 was `BoundsCheck`, `PacketGather` /
+`PacketScatter`, the texture trio, and the OptiX-only kinds. Two of those four
+dissolved on inspection.
+
+**Textures need nothing.** `drjit/texture.h:43` gates every hardware path on
+
+```cpp
+static constexpr bool HasGPUTexture =
+    (IsHalf || IsSingle || IsUInt8) && (IsCUDA || IsMetal);
+```
+
+A HIP array is neither, so every `if constexpr (HasGPUTexture)` branch compiles
+out and `dr::Texture` takes its software path automatically. `TexLookup`,
+`TexFetchBilerp` and `TexWrite` are therefore never emitted for this backend,
+and Phases 6-7 are not blocked on them. PLAN §5 called textures "more
+deferrable than they look"; they are in fact free.
+
+The trap for later: when Layer B adds `is_hip_v`, do **not** add `IsHIP` to
+that disjunction. Doing so switches on a hardware path (`jit_hip_tex_*`) that
+does not exist. Measure the software path's cost on the MI210 first — and note
+that on CUDA the hardware units resolve sub-texel position with only 8
+fractional bits, so the software path is *more* accurate, not less.
+
+**Scatter aggregation is not a correctness gap.** §3.3 flagged
+`cuda_scatter.cpp`'s peer aggregation -- `activemask.b32`, 31-clamped
+`shfl.sync.bfly.b32`, `vote.sync.ballot.b32` -- as needing redesign for a
+64-wide ballot. It does, but only if we want it: the HIP backend issues plain
+per-lane atomics, which are always correct and merely slower under contention.
+There is no wave64 ballot to redesign because there is no ballot. That leaves
+the redesign a performance task for after the backend is correct, which is
+where §11's discipline says it belongs.
+
+**Packet memory needs no wide-vector machinery.** Metal reinterprets through
+`uint4` / `as_type<>` and CUDA through `ld.global.v4`, because MSL and PTX will
+not merge adjacent accesses for them. HIP compiles C++ through LLVM, which
+does. Measured on gfx90a: an element-wise packet body and an explicit `float4`
+body produce the same machine code -- one `global_load_dwordx4`, one
+`global_store_dwordx4` -- even when the pointer arrives as an opaque `void *`
+from the params struct, because the `index * total_bytes` stride is enough for
+LLVM to infer 16-byte alignment. Element-wise it is.
+
+The one thing packet memory *does* demand care with is the index scaling, and
+it is asymmetric: `op.cpp` pre-multiplies the SCATTER index by the packet width
+and not the gather index, so
+
+```
+PacketGather   byte address = ptr + index * (count * tsize)
+PacketScatter  byte address = ptr + index * tsize
+```
+
+CUDA and Metal agree on this, so it is a contract of the IR rather than a
+backend convention. Getting it backwards compiles and reads the wrong packet.
+`spec_packet.hip` pins it, and `tests/hip_codegen.cpp` checks both halves
+against independently computed expectations rather than against each other --
+a round trip through one opcode would hide a shared error.
+
+**Verify that a new opcode is actually reached.** This is the sharpest lesson
+of Phase 4, and it cost two wrong conclusions before it stuck.
+
+`jit_var_gather_packet()` silently falls back to N scalar gathers under half a
+dozen conditions (`op.cpp:2169`) -- `JitFlag::PacketOps` off, an unaligned or
+literal source, a symbolic source. A test written against the public API can
+therefore pass without ever entering the new code. Both packet renderers were
+confirmed by temporarily replacing their bodies with `jitc_fail()` and watching
+the test die.
+
+The same technique then overturned a fix. `render_scatter_packet()`'s reduce
+path emitted every element into one block, which redeclares the locals that
+`render_scatter_reduce()`'s compare-and-swap form introduces -- a real defect.
+A test was written for it, using `ReduceOp::Min` on `Float32` because that is
+the combination with no native atomic. It passed *with the defect reinstated*.
+The tripwire explained why: `op.cpp`'s `use_packet_op` selection has arms for
+LLVM, CUDA and Metal and **none for HIP**, so a non-Identity packet scatter
+decomposes into scalar ones and never reaches the branch at all.
+
+Three things to take from that:
+
+- **A per-backend if/else chain in shared code is where HIP goes missing.** §9
+  warns about this in general; `use_packet_op` is a live instance, and it fails
+  open (correct, slower) rather than loudly. The omission is now commented at
+  the site rather than left to be rediscovered.
+- **Name a test after what it exercises, not what you meant it to.** The check
+  above is worth keeping -- the decomposed path really is what HIP runs, and it
+  really is correct -- but calling it "CAS path" was a lie that would have
+  outlived the memory of writing it.
+- **`ReduceOp::Mul` never reaches any backend.** `jitc_can_scatter_reduce()`
+  rejects it outright ("no multiplication reduction atomics"), so the `Mul` arm
+  in `render_scatter_reduce()` is dead code. Do not reach for it as a test
+  vector.
+
+**`jitc_can_scatter_reduce()` had no HIP arm either**, which was worse than the
+packet one: the generic answers permit `Float16` atomics, while
+`jitc_hip_render()` fails on them (there is no 16-bit `atomicCAS`, hence no
+correct lowering). Capability tables that over-promise turn a graceful fallback
+into an abort halfway through codegen. It now says no, and the packed `f16x2`
+treatment stays on the Phase 4 remainder list.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate

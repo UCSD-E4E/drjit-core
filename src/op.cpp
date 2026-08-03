@@ -2639,6 +2639,19 @@ bool jitc_can_scatter_reduce(JitBackend backend, VarType vt, ReduceOp op) {
     is_metal = jitc_is_metal(backend);
 #endif
 
+#if defined(DRJIT_ENABLE_HIP)
+    // The HIP backend lowers anything without a native atomic to a
+    // compare-and-swap loop, so it is more permissive than CUDA here -- float
+    // min/max work, they are just slower. The exception is Float16: there is no
+    // 16-bit atomicCAS, so there is no correct lowering at all, and
+    // jitc_hip_render() fails rather than inventing one. Saying so here turns
+    // that into a graceful fallback instead of an abort halfway through
+    // codegen. (Removing this needs the packed f16x2 treatment the CUDA backend
+    // uses -- PLAN.md Phase 4.)
+    if (jitc_is_hip(backend) && vt == VarType::Float16)
+        return false;
+#endif
+
     // LLVM prior to v15.0.0 lacks minimum/maximum atomic reduction intrinsics
     if (is_llvm && (op == ReduceOp::Min || op == ReduceOp::Max) &&
         jitc_llvm_version_major < 15)
@@ -3110,6 +3123,14 @@ uint32_t jitc_var_scatter_packet(size_t n, uint32_t target_,
             use_packet_op = t32 && (mode == ReduceMode::Local ||
                                     mode == ReduceMode::Auto);
         }
+        // No HIP arm, deliberately: a packet scatter-REDUCE decomposes into
+        // scalar ones, which is correct and costs essentially nothing today.
+        // What makes the packet form worth having on CUDA is ReduceMode::Local
+        // (one atomic per group of lanes hitting the same address), and the HIP
+        // backend does not implement Local yet -- so the packet path would
+        // issue exactly the same atomics the scalar path does, via a shared
+        // base pointer. jitc_hip_render() implements the reduce case anyway, so
+        // adding an arm here is a one-line change once Local lands.
     }
 
     // If the packet size is not divisible by two we cannot use packet ops.

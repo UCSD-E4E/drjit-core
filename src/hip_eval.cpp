@@ -174,12 +174,24 @@ static void render_atomic_addr(Variable *value, Variable *ptr, Variable *index) 
 /// backends implement) is deliberately ignored. Plain atomics are always
 /// correct, just slower under heavy contention; adding the aggregation is a
 /// performance task and belongs after the backend is correct.
+/// `elem_offset` shifts the target by that many ELEMENTS of the value type,
+/// for packet scatter-reduce: op.cpp hands the opcode an index already scaled
+/// to the packet's first element, and the rest follow contiguously.
 static void render_scatter_reduce(ReduceOp op, Variable *ptr, Variable *value,
-                                  Variable *index) {
+                                  Variable *index, uint32_t elem_offset = 0) {
     VarType vt = (VarType) value->type;
     uint32_t width = type_size[(int) vt];
     bool is_float = jitc_is_float(value),
          is_int   = !is_float && (vt != VarType::Bool);
+
+    // The index as source text, so the offset can ride along without every
+    // address site below growing a second spelling. Zero offset reproduces the
+    // previous output exactly, which keeps cached kernels valid.
+    char idx[48];
+    if (elem_offset)
+        snprintf(idx, sizeof(idx), "r%u + %u", index->reg_index, elem_offset);
+    else
+        snprintf(idx, sizeof(idx), "r%u", index->reg_index);
 
     if (width != 4 && width != 8)
         jitc_fail("jitc_hip_render(): scatter-reduce on a %u-byte type is not "
@@ -217,11 +229,11 @@ static void render_scatter_reduce(ReduceOp op, Variable *ptr, Variable *value,
 
     if (fn) {
         if (via_u64)
-            fmt("    $s(($b *) (($t *) $v + $v), ($b) $v);\n",
-                fn, value, value, ptr, index, value, value);
+            fmt("    $s(($b *) (($t *) $v + $s), ($b) $v);\n",
+                fn, value, value, ptr, idx, value, value);
         else
-            fmt("    $s(($t *) $v + $v, $v);\n",
-                fn, value, ptr, index, value);
+            fmt("    $s(($t *) $v + $s, $v);\n",
+                fn, value, ptr, idx, value);
         return;
     }
 
@@ -229,11 +241,11 @@ static void render_scatter_reduce(ReduceOp op, Variable *ptr, Variable *value,
     //
     // The CAS width follows the VALUE width ($b is the same-width unsigned
     // integer): a 32-bit CAS on a double would spin on half of it forever.
-    fmt("    $b *_a = ($b *) (($t *) $v + $v);\n"
+    fmt("    $b *_a = ($b *) (($t *) $v + $s);\n"
         "    $b _o = *_a, _s;\n"
         "    do {\n"
         "        _s = _o;\n",
-        value, value, value, ptr, index,
+        value, value, value, ptr, idx,
         value);
 
     // Recombine through the binary view. from/to_bits are no-ops for integers.
@@ -268,6 +280,99 @@ static void render_scatter_reduce(ReduceOp op, Variable *ptr, Variable *value,
         fmt("        _o = atomicCAS(_a, _s, ($b) _n);\n", value);
 
     put("    } while (_s != _o);\n");
+}
+
+// ---------------------------------------------------------------------------
+//  Packet memory
+// ---------------------------------------------------------------------------
+//
+// A packet gather/scatter moves `count` CONTIGUOUS elements per lane in one
+// operation, so the hardware can coalesce them.
+//
+// The two halves scale their index differently, and this is a property of the
+// IR rather than a backend choice -- op.cpp has already multiplied the SCATTER
+// index by `count` before the opcode sees it, and not the gather index:
+//
+//     PacketGather   byte address = ptr + index * (count * tsize)
+//     PacketScatter  byte address = ptr + index * tsize
+//
+// Both CUDA (cuda_packet.cpp's two `mad.wide` forms) and Metal
+// (metal_packet.cpp's two base-pointer expressions) agree. spec_packet.hip
+// pins it, because getting it backwards compiles and then reads the wrong
+// packet.
+//
+// Unlike those two backends, HIP needs no wide-vector machinery. Metal
+// reinterprets through `uint4`/`as_type<>` and CUDA through `ld.global.v4`
+// because MSL and PTX will not merge adjacent accesses for them; HIP compiles
+// C++ through LLVM, which does. Measured on gfx90a, the element-wise form
+// below and an explicit `float4` form produce the same machine code -- one
+// global_load_dwordx4 and one global_store_dwordx4 -- even with the pointer
+// arriving as an opaque void* from the params struct, because the `index *
+// total_bytes` stride is enough for LLVM to infer 16-byte alignment. Staying
+// element-wise is also the only form that is correct for a packet width that
+// is not a power of two without a chunk-size computation.
+
+static void render_gather_packet(Variable *v, Variable *ptr, Variable *index,
+                                 Variable *mask) {
+    uint32_t count       = (uint32_t) v->literal,
+             tsize       = type_size[v->type],
+             total_bytes = count * tsize;
+    bool unmasked = mask->is_literal() && mask->literal == 1;
+
+    fmt("const $t *$v_base = (const $t *) ((const char *) $v + (size_t) $v * $u);\n",
+        v, v, v, ptr, index, total_bytes);
+
+    // Every output is DEFINED even on a masked-off lane: they are referenced
+    // unconditionally further down the kernel, so a conditional load would
+    // propagate an uninitialised register.
+    for (uint32_t i = 0; i < count; ++i) {
+        if (unmasked)
+            fmt("$t $v_out_$u = $v_base[$u];\n", v, v, i, v, i);
+        else
+            fmt("$t $v_out_$u = $v ? $v_base[$u] : ($t) 0;\n",
+                v, v, i, mask, v, i, v);
+    }
+}
+
+static void render_scatter_packet(Variable *v, Variable *ptr, Variable *index,
+                                  Variable *mask) {
+    PacketScatterData *psd = (PacketScatterData *) v->data;
+    const std::vector<uint32_t> &values = psd->values;
+    uint32_t count = (uint32_t) values.size();
+    Variable *v0 = jitc_var(values[0]);
+    bool unmasked = mask->is_literal() && mask->literal == 1;
+
+    if (!unmasked)
+        fmt("if ($v) {\n", mask);
+    else
+        put("{\n");
+
+    if (psd->op != ReduceOp::Identity) {
+        // ReduceMode::Local (warp pre-aggregation) is ignored here for the same
+        // reason as in the scalar path: plain atomics are always correct, just
+        // slower under contention.
+        //
+        // Each element gets its OWN block. render_scatter_reduce()'s
+        // compare-and-swap form declares `_a`, `_o` and `_s` in the enclosing
+        // scope, so emitting several into one block redeclares them -- a
+        // compile error for any op without a native atomic (float min/max).
+        //
+        // This branch is currently UNREACHABLE: op.cpp's `use_packet_op` has no
+        // HIP arm, so packet scatter-reduces decompose into scalar ones. It is
+        // written and correct so that adding that arm -- which becomes worth
+        // doing once ReduceMode::Local lands -- is a one-line change.
+        for (uint32_t i = 0; i < count; ++i) {
+            put("    {\n");
+            render_scatter_reduce(psd->op, ptr, jitc_var(values[i]), index, i);
+            put("    }\n");
+        }
+    } else {
+        fmt("    $t *_p = ($t *) $v + $v;\n", v0, v0, ptr, index);
+        for (uint32_t i = 0; i < count; ++i)
+            fmt("    _p[$u] = $v;\n", i, jitc_var(values[i]));
+    }
+
+    put("}\n");
 }
 
 /// Emit a math call, choosing the double or float spelling by operand type.
@@ -525,6 +630,37 @@ static void jitc_hip_render(Variable *v) {
         // `?:` short-circuits, so the load genuinely does not execute on masked
         // lanes; the two-statement form would read out of bounds on every one
         // of them (spec_memory.hip).
+        // Emitted only under JitFlag::Debug -- which is exactly the mode a
+        // backend under construction is run in, so leaving it unhandled makes
+        // the one setting that would explain a wrong answer the one setting
+        // that cannot run.
+        //
+        // The result is the incoming MASK with out-of-bounds lanes cleared, not
+        // a validity flag: the gather or scatter downstream is predicated on
+        // it. The comparison is deliberately written with the bound cast rather
+        // than the index, so the usual arithmetic conversions promote a signed
+        // index to unsigned (a negative index must fail, and signed it would
+        // pass) and widen the bound against a 64-bit index rather than
+        // truncating it. Both are asserted by spec_bounds.hip.
+        case VarKind::BoundsCheck: {
+            Variable *index = jitc_var(v->dep[0]),
+                     *mask  = jitc_var(v->dep[1]),
+                     *buf   = jitc_var(v->dep[2]);
+            uint32_t size = (uint32_t) v->literal;
+
+            // Predicated on `mask && !in_bounds`, not on the comparison alone:
+            // a lane the caller already disabled must not report a position it
+            // never read. Concurrent writers race, which is fine -- the host
+            // wants a non-zero word and one offending index.
+            fmt("$t $v = $v && ($v < (u32) $u);\n"
+                "if ($v && !$v)\n"
+                "    *(u32 *) $v = (u32) $v;\n",
+                v, v, mask, index, size,
+                mask, v,
+                buf, index);
+            break;
+        }
+
         case VarKind::Gather: {
             Variable *src   = jitc_var(v->dep[0]);
             Variable *index = jitc_var(v->dep[1]);
@@ -538,6 +674,16 @@ static void jitc_hip_render(Variable *v) {
                     v, v, mask, v, src, index, v);
             break;
         }
+
+        case VarKind::PacketGather:
+            render_gather_packet(v, jitc_var(v->dep[0]), jitc_var(v->dep[1]),
+                                 jitc_var(v->dep[2]));
+            break;
+
+        case VarKind::PacketScatter:
+            render_scatter_packet(v, jitc_var(v->dep[0]), jitc_var(v->dep[1]),
+                                  jitc_var(v->dep[2]));
+            break;
 
         case VarKind::Scatter: {
             Variable *ptr   = jitc_var(v->dep[0]);
@@ -683,10 +829,11 @@ static void jitc_hip_render(Variable *v) {
             Variable *src = jitc_var(v->dep[0]);
             uint32_t sub_index = (uint32_t) v->literal;
 
-            // ScatterCAS is the only multi-output op this backend emits so far;
-            // TraceRay / PacketGather / TexLookup land in the default case and
+            // ScatterCAS and PacketGather are the multi-output ops this backend
+            // emits so far; TraceRay / TexLookup land in the default case and
             // say so explicitly rather than silently extracting field 0.
-            if ((VarKind) src->kind == VarKind::ScatterCAS)
+            if ((VarKind) src->kind == VarKind::ScatterCAS ||
+                (VarKind) src->kind == VarKind::PacketGather)
                 fmt("$t $v = $v_out_$u;\n", v, v, src, sub_index);
             else
                 fmt("$t $v = $v; // extract[$u]\n", v, v, src, sub_index);
