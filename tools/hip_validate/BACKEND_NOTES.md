@@ -1139,6 +1139,127 @@ up as somebody else's bug.
 compile with `DRJIT_ENABLE_CUDA=OFF` — `optix_api.h` names `CUcontext`,
 `CUstream` and `CUdeviceptr` unguarded. Configure the control with CUDA on.)
 
+## 11n. Layer C — what HIP-RT's scene model forces, and what it does not
+
+Phase 7 (`hip_ad_rgb`) took ~700 lines across Mitsuba and one 20-line accessor
+in drjit-core. It renders a mesh scene matching `llvm_ad_rgb` to **1.19e-07**.
+That number is the correctness argument, not a smoke test: LLVM traces through
+Embree and certainly sees the geometry, so HIP-RT agreeing to single-precision
+epsilon means it is intersecting rather than quietly missing. A backend that
+reports "no hit" for everything also produces a stable image.
+
+### One structural difference, and it is in the scene model
+
+`hiprtHit` is `{instanceID, primID, uv, normal, t}` — verified in
+`hiprt_types.h`, not assumed. **There is no geometry ID**, because a
+`hiprtInstance` references exactly one geometry, so "which geometry" is a
+property of the instance. Metal and OptiX both nest geometries inside an
+instance and report the pair per hit.
+
+So a `BlasEntry` holding N same-kind geometries cannot become one instance.
+`build_hip_accel()` expands each (instance, geometry) pair into its own HIP-RT
+instance and returns the geometry index through the instance-indexed table
+`jit_hip_configure_scene()` already accepted. By the time the values reach
+Mitsuba they are exactly Metal's — which is why `scene_hip.inl` reuses
+`scene_metal.inl`'s recovery logic verbatim rather than reimplementing it.
+
+Two smaller obligations that fail silently if missed:
+
+- **Borrow the context, never create one.** `hiprtGeometry` / `hiprtScene`
+  handles are context-scoped. A scene built against a second context does not
+  error — it traverses garbage. `jit_hip_rt_context()` exists for this, as
+  `jit_metal_context()` does for Metal.
+- **Allocate through `jit_malloc(JitBackend::HIP, ...)`, not `hipMalloc`.**
+  Under the shim "HIP" is CUDA-backed, so `hipMalloc` would work on the MI210
+  and fail on the development machine.
+
+### `to_world` needs a transpose that nothing will catch
+
+SceneIR stores the affine column-major as four columns of three floats —
+element (row, col) is `to_world[col * 3 + row]` (confirmed against
+`metal_accel.mm`, not from the comment alone). `hiprtFrameMatrix` is
+`matrix[row][col]`. Get this backwards and geometry lands somewhere plausible
+but wrong, which no assertion catches and a render only hints at. It is spelled
+out as a nested loop rather than memcpy'd for that reason.
+
+### The build wiring, where four of six bugs lived
+
+- Mitsuba never forwarded `DRJIT_ENABLE_HIP`, so it compiled `MI_ENABLE_HIP`
+  code against a Dr.Jit with no HIP backend.
+- It read drjit-core's `DRJIT_HIPRT_PATH`, which is only set inside the
+  **CUDA-shim branch** — so the check would have worked on this laptop and
+  failed on the MI210. **The shim's usual risk is flattering the developer;
+  this was the reverse, and it is the shape to watch for.**
+- `PRIVATE` link options on an **OBJECT** library never reach the consuming
+  link (`cannot find -lhiprt64`). Use an absolute `.so` path and `PUBLIC`.
+- `drjit_v.cpp`'s backend-name chain stopped at Metal, so a HIP variant would
+  have imported `drjit.scalar`.
+
+### The color tables: caught by luck
+
+`get_color_space_tables<Float>()` had no HIP arm, so it fell through to the
+**scalar** tables. This produced a compile error only because the types differ
+(`gather_(DynamicArray<float>&, ...)` with a HIP index). The identical omission
+in a non-template context is a host pointer handed to a device kernel, silently.
+It is now the worked example in `mitsuba::is_gpu_v`'s documentation of where
+*not* to use the trait.
+
+### `is_cuda_v` is four questions, not one
+
+The plan estimated "~20 sites to generalize". There are 31, and they ask
+different things — treating them as one class is how a resource selection gets
+collapsed onto a capability trait:
+
+| Count | Question | Fix |
+|---|---|---|
+| 15 | "CPU path?" / "host-addressable memory?" | `mitsuba::is_gpu_v` |
+| 4 | genuinely OptiX-specific | unchanged, already inside `MI_ENABLE_CUDA` |
+| 2 | per-backend **resource** (color tables, module name) | a real HIP arm |
+| ~2 | `sphere`/`cylinder` precision policy | **left alone** |
+
+The last row is worth the ink: they test `is_cuda_v<FloatP>` where `FloatP` is a
+**packet** type, so the predicate is always false, and GPU variants never reach
+packet methods anyway (`shape.h` throws). Dead code. Changing it would only
+perturb numerics for no benefit — *not every match for your grep is a bug*.
+
+### 11n.1 The open bug: hiprtBuildTraceKernels on loop/vcall kernels
+
+Every remaining crash in the Mitsuba suite on HIP has **one** root cause, and it
+is worth stating precisely because the surface symptoms look unrelated:
+`test_ad::test01_bsdf_reflectance_backward`, `test_aov::test06_..._ad_backward`,
+`test_ad_integrators::test01_rendering_primal`, `test_freeze`, and
+`test_mesh::test14` all die inside `jitc_hip_compile()`.
+
+What is established:
+
+- The failure is `hiprtBuildTraceKernels()` returning **`hiprtErrorInternal`
+  (2)**, or segfaulting *inside itself* — the faulthandler trace names
+  `libhiprt0300064.so` frames beneath `hiprtBuildTraceKernels`. So HIP-RT's own
+  builder is the thing failing, not our emitted text being rejected by a
+  compiler that then reports a diagnostic. **No compiler diagnostic is ever
+  printed**, which is §7b's "fails late and unhelpfully" exactly.
+- It is **not** cumulative resource exhaustion. A loop building and destroying
+  12 scenes, tracing each, is clean. Eight *distinct* traced kernels in one
+  process are clean.
+- It **is** specific to kernels that contain a trace **and** come from
+  `ad_loop()` (a symbolic loop) or `jit_var_call_reduce()` (a vcall). Those are
+  exactly the kernels a real integrator generates, which is why a direct
+  `ray_intersect_preliminary` renders perfectly (1.19e-07 vs LLVM) while
+  `mi.render()` through the path integrator does not.
+- `test_mesh::test14` needs `test13` to have run first; run alone it passes. So
+  some cross-test state changes which kernel is generated, not whether the bug
+  exists.
+
+The next step is to dump the failing source (drjit-core already logs it on
+failure) and feed it to `tools/hip_validate`, which compiles standalone through
+both arms. That separates "our emitted HIP is invalid" from "HIP-RT 3.0.3's
+builder cannot handle this shape of kernel" — and the answer decides whether the
+fix is in `hip_eval.cpp` or in how `jitc_hip_shim_rt_compile()` invokes HIP-RT.
+
+**Do not assume it is shim-only.** `hiprtBuildTraceKernels()` is the API the
+backend compiles through on real hardware too (§7a), so a builder limitation
+here is a limitation on the MI210 unless proven otherwise.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
