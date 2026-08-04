@@ -23,6 +23,23 @@ extern "C" {
 #endif
 
 /**
+ * \brief Return the ``hiprtContext`` Dr.Jit compiles traversing kernels against
+ *
+ * The analogue of \c jit_metal_context(). An application that builds its own
+ * geometries and scenes (Mitsuba's ``src/render/hip/accel.cpp``) must use this
+ * context rather than creating one: HIP-RT's geometry and scene handles are
+ * context-scoped, so a scene built against a second context traverses garbage
+ * instead of failing cleanly.
+ *
+ * The context is created on demand, so it does not matter whether the
+ * application or the kernel compiler asks first.
+ *
+ * \return The ``hiprtContext``, or \c NULL if HIP-RT is unavailable in this
+ * build (see \ref jit_hip_compile's diagnostic).
+ */
+extern JIT_EXPORT void *jit_hip_rt_context();
+
+/**
  * \brief Inform Dr.Jit about a per-scene HIP-RT configuration.
  *
  * Registers a built ``hiprtScene`` and returns a JIT variable index that owns

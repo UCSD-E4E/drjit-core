@@ -577,6 +577,16 @@ void jit_metal_scene_set_cleanup(uint32_t scene_index,
 
 // --- HIP ray tracing (drjit-core/hip.h) -------------------------------------
 
+void *jit_hip_rt_context() {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_HIP)
+    return jitc_hip_rt_context();
+#else
+    jit_raise("jit_hip_rt_context(): HIP backend not enabled.");
+    return nullptr;
+#endif
+}
+
 uint32_t jit_hip_configure_scene(void *scene, void *func_table,
                                  const void *geometry_ids,
                                  const void *user_instance_ids,

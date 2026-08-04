@@ -540,6 +540,26 @@ static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
 
 #endif // DRJIT_HIP_SHIM_HIPRT
 
+/// Public accessor for the HIP-RT context, mirroring jit_metal_context().
+///
+/// The application (Mitsuba's src/render/hip/accel.cpp) builds its geometries
+/// and scenes with this. It MUST be the same context the traversing kernels are
+/// compiled against: hiprtGeometry and hiprtScene handles are context-scoped,
+/// so a scene built against a second context traverses garbage rather than
+/// failing cleanly.
+///
+/// Creates the context on demand, so the first caller may equally be the
+/// application or the kernel compiler.
+void *jitc_hip_rt_context() {
+#if defined(DRJIT_HIP_SHIM_HIPRT)
+    if (!jitc_hip_shim_rt_init())
+        return nullptr;
+    return (void *) jitc_hiprt_ctx;
+#else
+    return nullptr;
+#endif
+}
+
 std::pair<void *, bool> jitc_hip_compile(const char *source,
                                          const char *kernel_name) {
     // Does this kernel traverse? The emitted HIP-RT include is the marker, and

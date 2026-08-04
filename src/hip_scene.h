@@ -63,6 +63,11 @@ struct HIPScene {
 /// Recover the HIPScene behind a scene variable, or fail loudly.
 extern HIPScene *jitc_hip_get_scene(uint32_t scene_index);
 
+/// The hiprtContext traversing kernels are compiled against, created on demand.
+/// Defined in hip_core.cpp. See jit_hip_rt_context() in drjit-core/hip.h for
+/// why an application building its own scenes must share this context.
+extern void *jitc_hip_rt_context();
+
 extern uint32_t jitc_hip_configure_scene(void *scene, void *func_table,
                                          const void *geometry_ids,
                                          const void *user_instance_ids,
