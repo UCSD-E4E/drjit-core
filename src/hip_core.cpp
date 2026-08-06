@@ -471,6 +471,10 @@ static bool jitc_hip_shim_rt_init() {
     ci.device = (hiprtApiDevice) state.devices[ts->device].id;
     ci.deviceType = hiprtDeviceNVIDIA;
 
+    // Current for the duration, for the same reason the build path below binds
+    // it: HIP-RT touches the context while setting itself up.
+    scoped_set_context guard(ts->context);
+
     hiprtError rv = hiprtCreateContext(HIPRT_API_VERSION, ci, jitc_hiprt_ctx);
     if (rv != hiprtSuccess) {
         jitc_hiprt_ctx = nullptr;
@@ -497,6 +501,24 @@ static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
     if (!jitc_hip_shim_rt_init())
         jitc_raise("jit_hip_compile(): this kernel performs ray tracing, but "
                    "the HIP-RT context could not be created.");
+
+    // Bind the CUDA context for the duration of the build.
+    //
+    // hiprtBuildTraceKernels() compiles and then LOADS a module, which is a
+    // context operation: CUDA applies it to whatever context is current on this
+    // thread. Every other CUDA-touching path in drjit-core takes this guard
+    // (jitc_cuda_compile, jitc_cuda_sync_stream, ...); this one did not, and
+    // the omission is invisible until something else changes the current
+    // context. Then hiprtBuildTraceKernels either returns hiprtErrorInternal or
+    // SEGFAULTS INSIDE ITSELF, with no diagnostic, on source that is perfectly
+    // valid -- proven by building the identical source standalone, where it
+    // succeeds.
+    //
+    // That is why the symptom looked like "kernels from symbolic loops and
+    // vcalls are miscompiled": those merely execute enough surrounding work to
+    // leave a different context current.
+    ThreadState *ts = thread_state(JitBackend::HIP);
+    scoped_set_context guard(ts->context);
 
     // NVRTC starts with an EMPTY include search list, so both the HIP-RT
     // device headers and <cuda_fp16.h> have to be spelled out.
