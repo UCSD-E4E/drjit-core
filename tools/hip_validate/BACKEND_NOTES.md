@@ -1304,21 +1304,60 @@ lines, five shape types) and the Mitsuba side of `build_hip_accel()` — AABB
 geometry via `fill_aabbs`, `hiprtCreateFuncTable`, per-primitive data upload,
 and the `jit_hip_set_isect_source()` call.
 
-**One unknown to settle first, cheaply.** The dispatcher HIP-RT *declares* is
+### 11o.1 The application function signature — settled
+
+The dispatcher HIP-RT *declares* in `impl/hiprt_device_impl.h:54` is the
+**generated** one, not the application function; the signature expected of the
+function named in `funcNameSets` is in no header, because the calling code is
+generated inside `hiprtBuildTraceKernels()`. It is:
 
 ```c
-HIPRT_DEVICE bool intersectFunc(uint32_t geomType, uint32_t rayType,
-                                const hiprtFuncTableHeader &tableHeader,
-                                const hiprtRay &ray, void *payload,
-                                hiprtHit &hit);
+__device__ bool <name>(const hiprtRay &ray, const void *data,
+                       void *payload, hiprtHit &hit);          // intersection
+__device__ bool <name>(const hiprtRay &ray, const void *data,
+                       void *payload, const hiprtHit &hit);    // filter
 ```
 
-(`impl/hiprt_device_impl.h:54`) — but that is the *generated* dispatcher, not
-the application function. The signature HIP-RT expects of the function named in
-`funcNameSets` is **not in the headers**, because the calling code is generated
-at build time. Determine it from HIP-RT's own samples or by building a trivial
-one-line intersector through `tools/hip_validate/rtrepro/`, before writing 500
-lines against a guessed prototype.
+Established two ways that agree — see `tools/hip_validate/isect_probe/`:
+
+1. **The shipped library.** `libhiprt0300064.so` carries the codegen templates
+   as string literals; `strings` recovers the forward declaration, the
+   dispatcher body and the call fragment `( ray, data, payload, hit ); }`.
+2. **A build**, through the real `hiprtBuildTraceKernels()`. The probe ships a
+   deliberately wrong signature as its negative arm and requires it to fail —
+   a wrong signature that also built would mean the dispatcher never referenced
+   our function, and the positive result would prove nothing.
+
+```
+probe_sphere.hip     -> 0 (SUCCESS)
+probe_wrong_sig.hip  -> 2 (FAILURE)   PTX JIT compilation failed [218]
+```
+
+The failure lands at PTX *link*, not compile: HIP-RT forward-declares the name
+it was given, so a mismatched definition is merely a different overload and the
+declared one goes undefined.
+
+**State on entry**, which decides the whole data-lookup design:
+
+| field             | state                                                    |
+|-------------------|----------------------------------------------------------|
+| `ray`             | **object space** — `transformRay()` already applied       |
+| `hit.primID`      | set, from the custom node (`hiprt_device_impl.h:1043`)    |
+| `hit.instanceID`  | set, top of `testLeafNode` (`:1032`)                      |
+| `hit.t/uv/normal` | ours to write; `return true` accepts the hit              |
+
+`data` is `funcDataSets[numGeomTypes * rayType + geomType]`, so it is per
+**geometry type**, not per geometry. `instanceID` being live is what makes the
+Metal lookup portable: Metal keys per-primitive data on
+`(instance_id, geometry_id)` and HIP-RT supplies `instanceID` — the geometry ID
+is redundant here because a HIP-RT instance references exactly one geometry
+(§11n, `src/hip_scene.h`).
+
+**A side result:** `numGeomTypes=1` with a populated `funcNameSets` builds
+cleanly under the CUDA shim, so §11n.1 is not triggered by merely asking for a
+function table.
+
+### 11o.2 Order of work
 
 **Recommended order:** do **sphere only**, end to end, and render it against
 `llvm_ad_rgb`. It is the simplest math (a quadratic, already written in

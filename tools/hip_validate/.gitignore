@@ -1,0 +1,4 @@
+# Standalone probe/reproducer binaries. Each is built by hand from the command
+# line in its own README; none is part of the CMake harness.
+/rtrepro/rtbuild
+/isect_probe/isect_probe
