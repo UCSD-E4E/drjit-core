@@ -499,11 +499,21 @@ static bool jitc_hip_shim_rt_init() {
 /// Application-provided custom-primitive intersection source, see
 /// jit_hip_set_isect_source(). Owned copies: the caller's buffers need not
 /// outlive the call, and every traversing kernel built afterwards uses these.
+///
+/// NOT part of the kernel cache key: hash_kernel() covers the GENERATED source
+/// only, and this text is prepended afterwards. Safe as long as an application
+/// registers one fixed source, which is what Mitsuba does (its intersection
+/// functions are compiled into libmitsuba-render). An application that varied
+/// the source between builds -- specializing per scene, say -- would be served
+/// a cached kernel carrying the previous intersectors, and the failure would
+/// look like wrong geometry rather than a stale cache. Fold this into the hash
+/// before allowing that.
 static std::string jitc_hip_isect_source;
 static std::vector<std::string> jitc_hip_isect_names, jitc_hip_filter_names;
 
-void jitc_hip_set_isect_source(const char *source, const char **isect_names,
-                               const char **filter_names,
+void jitc_hip_set_isect_source(const char *source,
+                               const char *const *isect_names,
+                               const char *const *filter_names,
                                uint32_t n_geom_types) {
     jitc_hip_isect_source.clear();
     jitc_hip_isect_names.clear();

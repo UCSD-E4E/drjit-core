@@ -577,8 +577,9 @@ void jit_metal_scene_set_cleanup(uint32_t scene_index,
 
 // --- HIP ray tracing (drjit-core/hip.h) -------------------------------------
 
-void jit_hip_set_isect_source(const char *source, const char **isect_names,
-                              const char **filter_names,
+void jit_hip_set_isect_source(const char *source,
+                              const char *const *isect_names,
+                              const char *const *filter_names,
                               uint32_t n_geom_types) {
     lock_guard guard(state.lock);
 #if defined(DRJIT_ENABLE_HIP)

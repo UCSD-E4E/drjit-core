@@ -85,15 +85,41 @@ int main(int argc, char **argv) {
 
     std::string src = slurp(path);
 
-    // Recover the entry point from the source, as rtbuild does.
+    // A source with no kernel of its own gets one appended. That is not a
+    // convenience -- it is the shape drjit-core actually builds: registered
+    // intersection source followed by a generated traversing kernel, both in
+    // one translation unit. It lets this probe compile
+    // src/render/hip/intersection_functions.hip from the Mitsuba tree directly,
+    // in a second, instead of finding its syntax errors via a failed render.
     std::string entry;
     {
         const char *k = "__global__ void ";
         size_t p = src.find(k);
-        if (p == std::string::npos) { fprintf(stderr, "no __global__ found\n"); return 2; }
-        p += strlen(k);
-        size_t q = src.find('(', p);
-        entry = src.substr(p, q - p);
+        if (p == std::string::npos) {
+            printf("no __global__ in source; appending the standard "
+                   "traversal kernel\n");
+            src +=
+                "\n"
+                "extern \"C\" __global__ void probe_kernel(\n"
+                "        hiprtScene scene, hiprtFuncTable table,\n"
+                "        const float *rays, float *out) {\n"
+                "    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+                "    hiprtRay _r;\n"
+                "    _r.origin    = { rays[i*8+0], rays[i*8+1], rays[i*8+2] };\n"
+                "    _r.direction = { rays[i*8+3], rays[i*8+4], rays[i*8+5] };\n"
+                "    _r.minT      = rays[i*8+6];\n"
+                "    _r.maxT      = rays[i*8+7];\n"
+                "    hiprtSceneTraversalClosest _tr(scene, _r, hiprtFullRayMask,\n"
+                "        hiprtTraversalHintDefault, nullptr, table);\n"
+                "    hiprtHit _h = _tr.getNextHit();\n"
+                "    out[i] = _h.hasHit() ? _h.t : -1.0f;\n"
+                "}\n";
+            entry = "probe_kernel";
+        } else {
+            p += strlen(k);
+            size_t q = src.find('(', p);
+            entry = src.substr(p, q - p);
+        }
     }
     printf("entry     = %s\n", entry.c_str());
     printf("intersect = %s\n", isect_fn  ? isect_fn  : "(none)");

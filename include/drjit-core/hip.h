@@ -43,6 +43,28 @@ extern "C" {
  *     HIP C++ device source defining every function named in \c isect_names and
  *     \c filter_names. May be \c NULL to clear a previous registration.
  *
+ *     The signatures are fixed by the dispatcher HIP-RT generates, and appear
+ *     in none of its headers because the calling code does not exist until
+ *     build time:
+ *
+ *     \code
+ *     __device__ bool name(const hiprtRay &ray, const void *data,
+ *                          void *payload, hiprtHit &hit);        // intersect
+ *     __device__ bool name(const hiprtRay &ray, const void *data,
+ *                          void *payload, const hiprtHit &hit);  // filter
+ *     \endcode
+ *
+ *     \c data is the matching ``hiprtFuncDataSet`` entry, so it is per geometry
+ *     type rather than per geometry. On entry \c ray is in OBJECT space and
+ *     both \c hit.primID and \c hit.instanceID are already populated; writing
+ *     \c hit.t / \c hit.uv and returning \c true accepts the hit.
+ *
+ *     A mismatched signature is not a compile error. HIP-RT forward-declares
+ *     each name it is given, so a wrong definition is simply a different
+ *     overload and the failure arrives later as an unresolved symbol during the
+ *     device link. See ``tools/hip_validate/isect_probe/``, which establishes
+ *     all of the above by building it.
+ *
  * \param isect_names
  *     Array of \c n_geom_types intersection-function names, indexed by geometry
  *     type. The geometry type of a primitive is set through
@@ -58,8 +80,8 @@ extern "C" {
  *     Number of geometry types. Zero clears the registration.
  */
 extern JIT_EXPORT void jit_hip_set_isect_source(const char *source,
-                                                const char **isect_names,
-                                                const char **filter_names,
+                                                const char *const *isect_names,
+                                                const char *const *filter_names,
                                                 uint32_t n_geom_types);
 
 /**

@@ -17,9 +17,7 @@
 #include <hiprt/hiprt_device.h>
 
 struct SphereData {
-    float4 center_radius;
-    float  to_world[12];
-    float  to_object[12];
+    float4 center_radius;   // xyz = center, w = radius
 };
 
 __device__ float mi_dot(const float3 &a, const float3 &b) {

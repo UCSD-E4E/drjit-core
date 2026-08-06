@@ -16,10 +16,11 @@
 
 #include <hiprt/hiprt_device.h>
 
+// Matches shapedata::SphereData in the Mitsuba tree. This file is the paired
+// positive control for probe_wrong_sig.hip -- the two must differ ONLY in the
+// signature under test -- so it keeps its own copy rather than sharing one.
 struct SphereData {
-    float4 center_radius;
-    float  to_world[12];
-    float  to_object[12];
+    float4 center_radius;   // xyz = center, w = radius
 };
 
 // Numerically stable quadratic solver; ordered roots x0 <= x1.

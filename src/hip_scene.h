@@ -71,8 +71,8 @@ extern void *jitc_hip_rt_context();
 /// Register custom-primitive intersection device source. Defined in
 /// hip_core.cpp; see jit_hip_set_isect_source() in drjit-core/hip.h.
 extern void jitc_hip_set_isect_source(const char *source,
-                                      const char **isect_names,
-                                      const char **filter_names,
+                                      const char *const *isect_names,
+                                      const char *const *filter_names,
                                       uint32_t n_geom_types);
 
 /// Number of geometry types currently registered (0 if none).
