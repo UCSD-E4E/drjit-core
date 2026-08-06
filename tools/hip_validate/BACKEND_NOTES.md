@@ -1282,6 +1282,56 @@ which the in-process case does and the standalone case does not); and bisect
 `test13` to find which of its operations arms the failure, since `test14` alone
 passes.
 
+## 11o. Custom primitives — the half that is built, and the half that is not
+
+**Built and compiling** (drjit-core `ad5b10d`): `jit_hip_set_isect_source()`
+registers HIP C++ device source plus per-geometry-type function names;
+`jitc_hip_shim_rt_compile()` concatenates it ahead of every traversing kernel
+and passes real `numGeomTypes` / `funcNameSets` to `hiprtBuildTraceKernels()`.
+`shapedata.h` has HIP arms. The emitter's refusal now means "nobody registered
+definitions" rather than "not implemented".
+
+**Why it is source registration and not a handle.** Metal ships a prebuilt
+`.metallib` of intersection functions because its driver links them at trace
+time. HIP-RT cannot: `hiprtBuildTraceKernels()` *generates* the
+`intersectFunc` / `filterFunc` dispatchers from `funcNameSets` and prepends
+them to the source it is handed, so the definitions must be compiled **with
+every generated kernel**. This is the same fact §7a-3 recorded from the other
+direction — who defines the hooks depends on the link route.
+
+**Still to do:** the device math (port `intersection_functions.metal`, 506
+lines, five shape types) and the Mitsuba side of `build_hip_accel()` — AABB
+geometry via `fill_aabbs`, `hiprtCreateFuncTable`, per-primitive data upload,
+and the `jit_hip_set_isect_source()` call.
+
+**One unknown to settle first, cheaply.** The dispatcher HIP-RT *declares* is
+
+```c
+HIPRT_DEVICE bool intersectFunc(uint32_t geomType, uint32_t rayType,
+                                const hiprtFuncTableHeader &tableHeader,
+                                const hiprtRay &ray, void *payload,
+                                hiprtHit &hit);
+```
+
+(`impl/hiprt_device_impl.h:54`) — but that is the *generated* dispatcher, not
+the application function. The signature HIP-RT expects of the function named in
+`funcNameSets` is **not in the headers**, because the calling code is generated
+at build time. Determine it from HIP-RT's own samples or by building a trivial
+one-line intersector through `tools/hip_validate/rtrepro/`, before writing 500
+lines against a guessed prototype.
+
+**Recommended order:** do **sphere only**, end to end, and render it against
+`llvm_ad_rgb`. It is the simplest math (a quadratic, already written in
+`intersection_functions.metal:86`) and it exercises every part of the
+mechanism — geometry type, func table, data upload, dispatch. Once one shape
+renders correctly the other four are repetition of a proven pattern; five
+written blind are five ways to be wrong at once.
+
+**Caveat carried from §11n.1:** these definitions compile through
+`hiprtBuildTraceKernels()`, the call that is currently failing on some
+in-process kernels. If that failure is sensitive to kernel complexity rather
+than to state, custom primitives may meet it sooner.
+
 ## 12. Suggested implementation order
 
 1. Skeleton + `Params` + the variable loop, arithmetic opcodes only. Validate
