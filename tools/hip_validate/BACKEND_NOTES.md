@@ -1250,15 +1250,37 @@ What is established:
   some cross-test state changes which kernel is generated, not whether the bug
   exists.
 
-The next step is to dump the failing source (drjit-core already logs it on
-failure) and feed it to `tools/hip_validate`, which compiles standalone through
-both arms. That separates "our emitted HIP is invalid" from "HIP-RT 3.0.3's
-builder cannot handle this shape of kernel" — and the answer decides whether the
-fix is in `hip_eval.cpp` or in how `jitc_hip_shim_rt_compile()` invokes HIP-RT.
+**The emitted source is VALID — the emitter is no longer a suspect.** The exact
+kernel drjit-core logs on failure was extracted and rebuilt standalone through
+`hiprtBuildTraceKernels()` with argument-for-argument identical parameters
+(`scratchpad/rtbuild.cpp`): **it succeeds**. Same text, same options, same
+`numGeomTypes`/`funcNameSets`, fresh process. So this is not a codegen bug, and
+"kernels from symbolic loops and vcalls are miscompiled" — which is what the
+symptom looked like — is the wrong description. The cause is **process state**.
 
-**Do not assume it is shim-only.** `hiprtBuildTraceKernels()` is the API the
-backend compiles through on real hardware too (§7a), so a builder limitation
-here is a limitation on the MI210 unless proven otherwise.
+Eliminated so far, each by direct experiment rather than reasoning:
+
+| Hypothesis | Test | Result |
+|---|---|---|
+| Invalid emitted HIP | rebuild the logged source standalone | **builds fine** |
+| Cumulative scene churn | 12 build/destroy cycles + trace | clean |
+| Many distinct kernels | 8 distinct traced kernels | clean |
+| Scenes interleaved with distinct kernels | 8 of each, alternating | clean |
+| Missing CUDA context binding | added `scoped_set_context` (a real bug, committed) | **still crashes** |
+| Device memory exhaustion | `nvidia-smi` trace during the failing run | **5.6 GB of 6 GB free at crash** |
+
+**Working assessment: a probable shim artifact, not yet proven.** What remains
+is HIP-RT-on-CUDA through Orochi — the least-travelled path in the stack, and
+the one AMD does not test. Against that, `hiprtBuildTraceKernels()` *is* the API
+real hardware compiles through (§7a), so this cannot be dismissed. It is
+deliberately parked rather than closed: the honest position is that we do not
+know, and finding out costs less on an MI210 than it does here.
+
+**If you pick this up, the next probes are:** build the same kernel twice
+against one `hiprtContext` in `rtbuild.cpp` (tests repeat-build in one context,
+which the in-process case does and the standalone case does not); and bisect
+`test13` to find which of its operations arms the failure, since `test14` alone
+passes.
 
 ## 12. Suggested implementation order
 
