@@ -1028,6 +1028,31 @@ thread apply all bt
 - **A process that produces correct output and then hangs is a shutdown bug, not
   a startup bug.** Check `Py_Finalize` before re-reading the code that worked.
 
+## 11m.1 Measurement constructs that report activity or success that is not there
+
+A running list, because every one of these has cost hours and they all share a
+shape: the *instrument* lies, and the lie looks like a result.
+
+* **`rc=$?` after any command substitution on the same line.**
+  `echo "$(basename $f) rc=$?"` reports `basename`'s status. Three renders were
+  reported as passing this way when all three had crashed. Capture `rc` on its
+  own line, first.
+* **`grep -c` exits 1 when the count is zero.** A build step that ends
+  `... ; grep -c error: log` is reported as FAILED on a clean build. Read the
+  log, not the chained status.
+* **`pgrep -f "ninja -C build"` matches the watching shell**, whose own command
+  line contains the pattern. Several wait loops then block on each other
+  forever, each reporting "still building" while nothing builds. Use
+  `pgrep -x ninja`, which matches the executable name.
+* **A single run of a nondeterministic failure.** See §11n.1a — one sweep
+  classified seven crashing files into two groups by their stack signature, and
+  the grouping was a coin flip.
+* **A skipped test** (the rest of this section) and **a deliberate refusal**
+  (§11o.3): both print as "not applicable here" and can hide a real bug.
+
+The common defence: before believing an instrument, ask what it would print if
+the thing it measures had failed.
+
 ## 11m. A skipped test is not a passing test
 
 The suite reported "green" while **497 tests never ran** — the seven C++
@@ -1222,6 +1247,60 @@ The last row is worth the ink: they test `is_cuda_v<FloatP>` where `FloatP` is a
 packet methods anyway (`shape.h` throws). Dead code. Changing it would only
 perturb numerics for no benefit — *not every match for your grep is a bug*.
 
+### 11n.2 The shape-recovery table is indexed by the EXPANDED instance id
+
+`scene_hip.inl` built `offsets` with one entry per SceneIR instance; the device
+gathers it with `hit.instanceID`, and `build_hip_accel()` makes one HIP-RT
+instance per (SceneIR instance, geometry) pair. Every geometry after the first
+in a BLAS therefore read past the end of the buffer.
+
+Why it survived the Phase 7 milestone, which claimed a 1.19e-07 match:
+
+* SceneIR buckets same-kind geometry into ONE BLAS. A single-mesh scene has one
+  BLAS, so every table base is `0` — and reading zeros off the end of the buffer
+  gives exactly the right answer. The bug is invisible until a second BLAS or a
+  second geometry exists.
+* The milestone measured whether HIP-RT *hit* the geometry. It did. Attribution
+  — which shape a hit belongs to — was never exercised.
+
+Two meshes silently shade each hit with its neighbour's BSDF; three spheres and
+a floor mis-assign every sphere but the first. Nothing errors.
+
+The general lesson, which is the reusable part: **a scene with one of something
+cannot distinguish an index from a base.** Any table lookup of the form
+`base[i] + j` needs a test with at least two `i` and two `j` before it means
+anything. `test15_many_top_level_meshes` is that test.
+
+### 11n.1a It is NONDETERMINISTIC — measured, not inferred
+
+The single most useful fact about this bug, and it was missed for two sessions
+because the failure was only ever run once per build. The same file, same
+command, same binary, three consecutive runs:
+
+```
+run1 rc=139 (SEGV)   libhiprt frames in the C stack: 4
+run2 rc=134 (abort)  libhiprt frames in the C stack: 0
+run3 rc=139 (SEGV)   libhiprt frames in the C stack: 4
+```
+
+always dying at the same test (`test_ad.py:73`). So:
+
+* **Do not classify these crashes by their signature.** A sweep that records
+  SEGV-vs-abort, or "has a `libhiprt` frame", is recording a coin flip. Seven
+  crashing files looked like two distinct bugs on one sweep and one bug on the
+  next; they are one.
+* Nondeterminism on fixed input rules out anything static. The emitted source
+  was already exonerated (§11n.1); this rules out the *arguments* too. What is
+  left is state: a race, a use-after-free, or an uninitialized read — ours or
+  HIP-RT's.
+* It also means **a passing run proves nothing** about this bug. Any experiment
+  aimed at it needs repetition, and any "fix" needs many runs before belief.
+
+That last point retires an assumption worth naming: heavy new use of
+`hiprtBuildTraceKernels` (the whole custom-primitive path) did NOT meet this
+failure, which looked like evidence against the complexity hypothesis. Given
+nondeterminism, it is weak evidence at best.
+
 ### 11n.1 The open bug: hiprtBuildTraceKernels on loop/vcall kernels
 
 Every remaining crash in the Mitsuba suite on HIP has **one** root cause, and it
@@ -1356,6 +1435,28 @@ is redundant here because a HIP-RT instance references exactly one geometry
 **A side result:** `numGeomTypes=1` with a populated `funcNameSets` builds
 cleanly under the CUDA shim, so §11n.1 is not triggered by merely asking for a
 function table.
+
+### 11o.3 A deliberate refusal can hide a real bug in the same test
+
+`build_hip_accel()` throws by shape type rather than rendering unsupported
+geometry as empty space, which is right. But `test14_many_top_level_analytic_shapes`
+— the one test that checks per-shape hit attribution — builds its scene from
+spheres AND disks. While disks were refused, that test never reached its
+assertions on HIP, and the shape-recovery bug in §11n.2 sat behind what read as
+a known, deliberate limitation.
+
+Two habits follow:
+
+1. When a backend refuses a feature, look at what else the refusing tests were
+   checking. "Fails for a known reason" is a claim about one reason.
+2. A contract worth testing is worth testing through the most boring geometry
+   that can express it. `test15_many_top_level_meshes` covers the same
+   attribution contract with meshes only, so no backend can skip it.
+
+And the mirror image, from the same day: the refusal message itself said "only
+spheres and triangle meshes are implemented" for about an hour after disk and
+cylinder landed. Prose that restates a capability table drifts from it. The
+message is now generated from `hip_fn_index()` via `hip_supported_shapes()`.
 
 ### 11o.2 Order of work
 
