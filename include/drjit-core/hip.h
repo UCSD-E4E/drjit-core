@@ -23,6 +23,46 @@ extern "C" {
 #endif
 
 /**
+ * \brief Register application device source providing custom-primitive
+ * intersection functions.
+ *
+ * HIP-RT dispatches custom (AABB / implicit) primitives through an
+ * ``intersectFunc`` and an optional ``filterFunc``, one pair per *geometry
+ * type*. Unlike Metal, those are not a separate compiled library that the
+ * driver links at trace time: ``hiprtBuildTraceKernels()`` GENERATES the
+ * dispatch and prepends it to the source it is given, so the definitions have
+ * to be compiled **together with each generated kernel**. That is why this is a
+ * source-registration call rather than a handle: Dr.Jit concatenates \c source
+ * ahead of every traversing kernel it builds.
+ *
+ * Call once, before any scene with custom geometry is configured. Registering
+ * different source after kernels have been built is not supported — the already
+ * compiled kernels keep the old definitions.
+ *
+ * \param source
+ *     HIP C++ device source defining every function named in \c isect_names and
+ *     \c filter_names. May be \c NULL to clear a previous registration.
+ *
+ * \param isect_names
+ *     Array of \c n_geom_types intersection-function names, indexed by geometry
+ *     type. The geometry type of a primitive is set through
+ *     ``hiprtGeometryBuildInput::geomType`` when its geometry is built, so the
+ *     ordering here is the application's own and must match what it builds.
+ *     An entry may be \c NULL for a geometry type that needs no intersector.
+ *
+ * \param filter_names
+ *     Array of \c n_geom_types any-hit filter names, or \c NULL if none are
+ *     needed. Individual entries may be \c NULL.
+ *
+ * \param n_geom_types
+ *     Number of geometry types. Zero clears the registration.
+ */
+extern JIT_EXPORT void jit_hip_set_isect_source(const char *source,
+                                                const char **isect_names,
+                                                const char **filter_names,
+                                                uint32_t n_geom_types);
+
+/**
  * \brief Return the ``hiprtContext`` Dr.Jit compiles traversing kernels against
  *
  * The analogue of \c jit_metal_context(). An application that builds its own

@@ -68,6 +68,16 @@ extern HIPScene *jitc_hip_get_scene(uint32_t scene_index);
 /// why an application building its own scenes must share this context.
 extern void *jitc_hip_rt_context();
 
+/// Register custom-primitive intersection device source. Defined in
+/// hip_core.cpp; see jit_hip_set_isect_source() in drjit-core/hip.h.
+extern void jitc_hip_set_isect_source(const char *source,
+                                      const char **isect_names,
+                                      const char **filter_names,
+                                      uint32_t n_geom_types);
+
+/// Number of geometry types currently registered (0 if none).
+extern uint32_t jitc_hip_isect_geom_types();
+
 extern uint32_t jitc_hip_configure_scene(void *scene, void *func_table,
                                          const void *geometry_ids,
                                          const void *user_instance_ids,

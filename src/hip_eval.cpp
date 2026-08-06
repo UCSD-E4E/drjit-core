@@ -408,18 +408,23 @@ static void render_scatter_packet(Variable *v, Variable *ptr, Variable *index,
 /// Registration dedups by content, so a kernel with a hundred traces emits one
 /// copy, and the globals machinery places it ahead of the kernel body.
 static void jitc_hip_emit_trace_preamble(const HIPScene *scene) {
-    // A function table means the scene has custom primitives, and HIP-RT
-    // dispatches through the hooks to intersect them -- which means telling
-    // hiprtBuildTraceKernels() about the geometry and ray types so it can
-    // generate the right dispatch. That is not wired up, and proceeding would
-    // report a miss for every custom shape: a black object in a render, a very
-    // long way from its cause. Fail at the moment the offending scene is used.
-    if (scene && scene->func_table)
+    // A function table means the scene has custom primitives, which HIP-RT
+    // intersects by dispatching through generated intersectFunc/filterFunc
+    // hooks. Those are generated from the geometry/ray types handed to
+    // hiprtBuildTraceKernels(), and their DEFINITIONS come from source the
+    // application registered via jit_hip_set_isect_source().
+    //
+    // Without that registration the hooks are stubs that report a miss for
+    // every custom shape -- a black object in a render, a very long way from
+    // its cause. So the check is now "did anyone provide the definitions?"
+    // rather than "is this feature implemented?".
+    if (scene && scene->func_table && jitc_hip_isect_geom_types() == 0)
         jitc_raise("jitc_hip_render(): this scene was configured with a "
-                   "hiprtFuncTable, but custom-primitive intersection "
-                   "functions are not implemented (PLAN.md Phase 5). Build the "
-                   "scene without one, or pass the geometry/ray types through "
-                   "to hiprtBuildTraceKernels().");
+                   "hiprtFuncTable, but no custom-primitive intersection "
+                   "source has been registered. Call "
+                   "jit_hip_set_isect_source() before configuring a scene with "
+                   "custom (implicit) geometry, or build the scene without a "
+                   "function table.");
 
     size_t off = buffer.size();
     put("#include <hiprt/hiprt_device.h>\n");

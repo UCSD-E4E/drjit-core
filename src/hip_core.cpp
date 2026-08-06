@@ -496,6 +496,41 @@ static bool jitc_hip_shim_rt_init() {
 }
 
 /// Compile a traversing kernel through HIP-RT and return its CUmodule.
+/// Application-provided custom-primitive intersection source, see
+/// jit_hip_set_isect_source(). Owned copies: the caller's buffers need not
+/// outlive the call, and every traversing kernel built afterwards uses these.
+static std::string jitc_hip_isect_source;
+static std::vector<std::string> jitc_hip_isect_names, jitc_hip_filter_names;
+
+void jitc_hip_set_isect_source(const char *source, const char **isect_names,
+                               const char **filter_names,
+                               uint32_t n_geom_types) {
+    jitc_hip_isect_source.clear();
+    jitc_hip_isect_names.clear();
+    jitc_hip_filter_names.clear();
+
+    if (!source || n_geom_types == 0)
+        return;
+
+    jitc_hip_isect_source = source;
+    for (uint32_t i = 0; i < n_geom_types; ++i) {
+        jitc_hip_isect_names.push_back(isect_names && isect_names[i]
+                                           ? isect_names[i] : std::string());
+        jitc_hip_filter_names.push_back(filter_names && filter_names[i]
+                                            ? filter_names[i] : std::string());
+    }
+
+    jitc_log(Info,
+             "jit_hip_set_isect_source(): registered %u geometry type%s of "
+             "custom-primitive intersection source (%zu bytes).",
+             n_geom_types, n_geom_types == 1 ? "" : "s",
+             jitc_hip_isect_source.size());
+}
+
+uint32_t jitc_hip_isect_geom_types() {
+    return (uint32_t) jitc_hip_isect_names.size();
+}
+
 static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
                                                         const char *name) {
     if (!jitc_hip_shim_rt_init())
@@ -540,12 +575,40 @@ static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
     hiprtApiModule mod = nullptr;
     const char *names[1] = { name };
 
+    // Custom-primitive intersection, if the application registered any. The
+    // definitions must be compiled WITH the kernel (hiprtBuildTraceKernels
+    // generates the dispatch and prepends it to this source), so they are
+    // concatenated ahead of the generated body rather than linked.
+    std::string combined;
+    const char *build_src = source;
+    uint32_t n_geom_types = (uint32_t) jitc_hip_isect_names.size();
+    std::vector<hiprtFuncNameSet> fn_sets;
+
+    if (n_geom_types) {
+        combined.reserve(jitc_hip_isect_source.size() + strlen(source) + 2);
+        combined = jitc_hip_isect_source;
+        combined += '\n';
+        combined += source;
+        build_src = combined.c_str();
+
+        fn_sets.resize(n_geom_types);
+        for (uint32_t i = 0; i < n_geom_types; ++i) {
+            fn_sets[i].intersectFuncName =
+                jitc_hip_isect_names[i].empty() ? nullptr
+                                                : jitc_hip_isect_names[i].c_str();
+            fn_sets[i].filterFuncName =
+                jitc_hip_filter_names[i].empty() ? nullptr
+                                                 : jitc_hip_filter_names[i].c_str();
+        }
+    }
+
     hiprtError rv = hiprtBuildTraceKernels(
-        jitc_hiprt_ctx, 1, names, source, name,
+        jitc_hiprt_ctx, 1, names, build_src, name,
         /* numHeaders = */ 0, nullptr, nullptr,
         (uint32_t) opts.size(), opts.data(),
-        /* numGeomTypes = */ 0, /* numRayTypes = */ 0,
-        /* funcNameSets = */ nullptr, &func, &mod, /* cache = */ false);
+        n_geom_types, /* numRayTypes = */ n_geom_types ? 1u : 0u,
+        fn_sets.empty() ? nullptr : fn_sets.data(),
+        &func, &mod, /* cache = */ false);
 
     if (rv != hiprtSuccess) {
         jitc_log(Warn, "jit_hip_compile(): generated source that HIP-RT failed "

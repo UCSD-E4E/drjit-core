@@ -577,6 +577,18 @@ void jit_metal_scene_set_cleanup(uint32_t scene_index,
 
 // --- HIP ray tracing (drjit-core/hip.h) -------------------------------------
 
+void jit_hip_set_isect_source(const char *source, const char **isect_names,
+                              const char **filter_names,
+                              uint32_t n_geom_types) {
+    lock_guard guard(state.lock);
+#if defined(DRJIT_ENABLE_HIP)
+    jitc_hip_set_isect_source(source, isect_names, filter_names, n_geom_types);
+#else
+    (void) source; (void) isect_names; (void) filter_names; (void) n_geom_types;
+    jit_raise("jit_hip_set_isect_source(): HIP backend not enabled.");
+#endif
+}
+
 void *jit_hip_rt_context() {
     lock_guard guard(state.lock);
 #if defined(DRJIT_ENABLE_HIP)
