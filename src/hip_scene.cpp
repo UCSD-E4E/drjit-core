@@ -89,9 +89,20 @@ uint32_t jitc_hip_configure_scene(void *scene, void *func_table,
 
 uint32_t jitc_hip_scene_owner_handle(uint32_t scene_index) {
     HIPScene *s = jitc_hip_get_scene(scene_index);
-    // An identity token for dr.freeze, not an owning reference: the pointer is
-    // drjit-core's own bookkeeping object, which outlives any single launch.
-    return jitc_var_pointer(JitBackend::HIP, s, scene_index, 0);
+    /* An identity token for dr.freeze, not an owning reference: the pointer is
+       drjit-core's own bookkeeping object, which outlives any single launch.
+
+       MUST be a UInt64 variable rather than a Pointer one. dr.freeze REJECTS
+       pointer-typed inputs outright ("Pointer inputs not supported!",
+       src/python/freeze.cpp), so jitc_var_pointer() here defeats the very
+       thing this handle exists for -- and does it at the point where a frozen
+       function is first called, far from this line. This mirrors
+       jitc_metal_scene_owner_handle(), which is the template
+       scene_hip.inl follows; the data pointer is the HIPScene owner, the same
+       pointer carried by jit_hip_ray_trace's scene parameter, so the recorder
+       keys both to one input slot. */
+    return jitc_var_mem_map(JitBackend::HIP, VarType::UInt64, (void *) s, 1,
+                            /* free = */ 0);
 }
 
 /// Cache a pointer variable for one of the scene's device resources.
@@ -100,20 +111,41 @@ uint32_t jitc_hip_scene_owner_handle(uint32_t scene_index) {
 /// scene share a single kernel parameter -- the parameter block is a fixed
 /// budget and a path tracer issues many traces against one scene.
 ///
-/// `dep` is deliberately 0. jitc_var_pointer() takes a REFERENCE on its dep to
-/// keep a drjit allocation alive for as long as a pointer to it exists, and
-/// passing the scene variable there would close a cycle: the scene owns this
-/// handle, the handle would own the scene, and the reference count could never
-/// reach zero -- so the cleanup callback would never fire and the application's
-/// HIP-RT objects would never be released. There is nothing for a dep to
-/// protect here in any case: a hiprtScene and the two ID tables are the
-/// application's memory, not drjit allocations, and their lifetime is what the
-/// cleanup callback exists to manage.
+/// EACH RESOURCE NEEDS A DEP, and it may not be the scene variable.
+///
+/// The frozen-function recorder resolves a resource parameter by following the
+/// pointer variable's dep[3] and checking that the target's `data` is the same
+/// address (RecordThreadState::launch, record_ts.cpp):
+///
+///     index = v->dep[3];  v = jitc_var(index);
+///     if (v->data != ptr) jitc_fail("... memory address did not match!");
+///
+/// So `dep = 0` -- which this used to pass -- makes a traced scene impossible
+/// to record, and the failure surfaces as an abort inside a frozen render with
+/// no mention of scenes or dependencies.
+///
+/// The dep may NOT be the scene variable: jitc_var_pointer() takes a reference
+/// on its dep, the scene owns these handles, and the cycle would keep the
+/// refcount off zero forever -- the cleanup callback would never fire and the
+/// application's HIP-RT objects would leak.
+///
+/// Both constraints are satisfied by a non-owning memory map over the resource
+/// itself: its `data` is the pointer by construction, and it references no
+/// scene variable, so there is no cycle. `free = 0` because a hiprtScene and
+/// the ID tables are the application's memory, not drjit allocations -- their
+/// lifetime is what the cleanup callback manages. This is Metal's arrangement
+/// (jitc_metal_scene_owner_handle) reached from the other direction.
 static uint32_t hip_scene_handle(uint32_t &slot, const void *ptr) {
     if (!ptr)
         return 0;
-    if (!slot)
-        slot = jitc_var_pointer(JitBackend::HIP, ptr, /* dep = */ 0, 0);
+    if (!slot) {
+        uint32_t owner = jitc_var_mem_map(JitBackend::HIP, VarType::UInt64,
+                                          (void *) ptr, 1, /* free = */ 0);
+        slot = jitc_var_pointer(JitBackend::HIP, ptr, owner, 0);
+        // jitc_var_pointer() took its own reference on `owner`; drop ours so
+        // the map dies with the pointer variable rather than outliving it.
+        jitc_var_dec_ref(owner);
+    }
     return slot;
 }
 

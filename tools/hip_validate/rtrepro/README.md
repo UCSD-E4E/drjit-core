@@ -1,4 +1,27 @@
-# `rtrepro` — standalone reproducer for the §11n.1 HIP-RT builder failure
+# `rtrepro` — how the §11n.1 HIP-RT builder failure was cornered
+
+**The bug is SOLVED** (BACKEND_NOTES §11n.1): drjit-core passed the kernel name,
+which is the source hash, as `hiprtBuildTraceKernels`'s `moduleName`. Compiling
+the same kernel twice in one process handed HIP-RT a duplicate bookkeeping key,
+and the second build dereferenced a stale module inside `cuModuleGetFunction`.
+
+These programs are kept because the elimination sequence is reusable, and
+because two of them are what finally made the answer findable.
+
+| program | question it answers |
+|---|---|
+| `rtbuild.cpp` | is the emitted source valid, standalone? (yes, 60/60) |
+| `nvrtc_then_hiprt.cpp` | does drjit-core's own NVRTC use break HIP-RT? (no) |
+| `statebisect.cpp` | does prior geometry / scene / allocation / a whole kernel sequence break it? (no) |
+
+All three answered "not this", which is what forced the real question: **not
+what, but where.** That was settled not by another standalone program but by
+`$DRJIT_HIP_DUMP_RT_SRC` (BEGIN/END markers around the call, showing 6 BEGIN and
+5 END) and by gdb naming the frame.
+
+---
+
+## Original notes
 
 `rtbuild.cpp` calls `hiprtBuildTraceKernels()` on a source file with
 **argument-for-argument identical** parameters to

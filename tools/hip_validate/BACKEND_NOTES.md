@@ -1247,6 +1247,67 @@ The last row is worth the ink: they test `is_cuda_v<FloatP>` where `FloatP` is a
 packet methods anyway (`shape.h` throws). Dead code. Changing it would only
 perturb numerics for no benefit — *not every match for your grep is a bug*.
 
+### 11n.1 SOLVED: the module name must be unique per build
+
+**The bug was ours.** `hiprtBuildTraceKernels()` takes a `moduleName`, and
+drjit-core passed the kernel name -- which is the SOURCE HASH. Compile the same
+kernel twice in one process, as any nontrivial render does, and HIP-RT is handed
+the same bookkeeping key twice; the second build then dereferences a module
+handle that is no longer valid:
+
+```
+hiprtBuildTraceKernels -> hiprt::Compiler::buildKernels
+  -> oroModuleGetFunction -> cuModuleGetFunction -> SIGSEGV
+```
+
+The fix is one argument: give each build a unique `moduleName`. It is
+independent of the FUNCTION name, which must keep matching the `__global__`
+symbol. `test_ad::test01` went from crashing 4/4 to passing 5/5.
+
+#### Three wrong beliefs kept this parked for two sessions
+
+Worth recording, because each was a reasonable-looking inference from real data.
+
+**"It is nondeterministic."** It is not. *Occurrence* is deterministic per
+kernel -- `test_ad::test01` crashed 4/4, `test_sdfgrid::test05` passed 8/8. Only
+the MANIFESTATION varies: a bare `hiprtErrorInternal` in some runs, a fault
+inside the call in others. Generalising "nondeterministic" from three differing
+signatures reframed the bug as a race and pointed every later experiment at
+state and timing, which is the one place it was not.
+
+**"Probably a shim artifact."** This was the comfortable conclusion, because it
+implied nothing could be done until the MI210 arrived. Wrong: a duplicate
+`moduleName` would have behaved identically on real hardware.
+
+**The reproducer came from the wrong failure mode.** `rtrepro/failing_kernel.hip`
+was captured from the branch that RETURNS an error -- the only branch that
+logs. The faulting branch never logged its source. Every "the emitted source is
+exonerated" result since Phase 7 was testing a kernel from the other mode. The
+conclusion happened to be true; the evidence did not support it.
+
+#### What actually worked
+
+Nothing until the guessing stopped:
+
+1. **Exonerate the source properly** -- 60 standalone runs, not one.
+2. **Replay each piece of process state** and clear it: NVRTC-first, prior
+   geometry, prior scene, 2 GiB held, repeated builds, the exact six-kernel
+   sequence. All clean (`rtrepro/statebisect.cpp`, `nvrtc_then_hiprt.cpp`).
+3. **BEGIN/END markers around the call** (`$DRJIT_HIP_DUMP_RT_SRC`). 6 BEGIN /
+   5 END proves the fault is INSIDE a specific build. This is the step that
+   mattered: the stack traces had already proven unreliable, and a marker is a
+   fact where a backtrace was an interpretation.
+4. **`cuCtxSynchronize()` before the build** -- returned 0 every time, killing
+   the sticky-context-error theory.
+5. **gdb, launching not attaching** (ptrace_scope=1). The frame named the call.
+
+Steps 3 and 5 took about twenty minutes and pointed straight at the argument.
+Steps 1 and 2, and the two sessions before them, were hypothesis.
+
+The general lesson: **when a stack trace and a marker disagree, believe the
+marker.** And when a bug resists, check that the artifact you have been
+reproducing against came from the failure you are actually chasing.
+
 ### 11n.2 The shape-recovery table is indexed by the EXPANDED instance id
 
 `scene_hip.inl` built `offsets` with one entry per SceneIR instance; the device
@@ -1271,95 +1332,51 @@ cannot distinguish an index from a base.** Any table lookup of the form
 `base[i] + j` needs a test with at least two `i` and two `j` before it means
 anything. `test15_many_top_level_meshes` is that test.
 
-### 11n.1a It is NONDETERMINISTIC — measured, not inferred
+### 11n.1a WITHDRAWN: "it is nondeterministic"
 
-The single most useful fact about this bug, and it was missed for two sessions
-because the failure was only ever run once per build. The same file, same
-command, same binary, three consecutive runs:
+This section claimed the §11n.1 crash was nondeterministic, on the evidence of
+three consecutive runs giving SEGV / abort / SEGV on identical input. The
+observation was real; the conclusion was wrong, and it cost a session.
 
-```
-run1 rc=139 (SEGV)   libhiprt frames in the C stack: 4
-run2 rc=134 (abort)  libhiprt frames in the C stack: 0
-run3 rc=139 (SEGV)   libhiprt frames in the C stack: 4
-```
+What varies is the MANIFESTATION, not the occurrence. Measured afterwards:
+`test_ad::test01` crashes 4/4, `test_sdfgrid::test05` passes 8/8. A given kernel
+either triggers the fault or does not, every time. The two signatures are the
+two ways HIP-RT reports the same duplicate `moduleName` -- returning
+`hiprtErrorInternal`, or faulting inside `cuModuleGetFunction`.
 
-always dying at the same test (`test_ad.py:73`). So:
+Kept rather than deleted, because the error is the instructive part: **varying
+symptoms are not evidence of a varying cause.** Reading "random" into it
+reframed the bug as a race and sent every later experiment after state and
+timing, which is exactly where it was not. That section's advice -- "never
+classify these crashes by stack signature" -- was right for the wrong reason:
+the signatures are uninformative because they are two faces of one
+deterministic fault, not because the fault is random.
 
-* **Do not classify these crashes by their signature.** A sweep that records
-  SEGV-vs-abort, or "has a `libhiprt` frame", is recording a coin flip. Seven
-  crashing files looked like two distinct bugs on one sweep and one bug on the
-  next; they are one.
-* Nondeterminism on fixed input rules out anything static. The emitted source
-  was already exonerated (§11n.1); this rules out the *arguments* too. What is
-  left is state: a race, a use-after-free, or an uninitialized read — ours or
-  HIP-RT's.
-* It also means **a passing run proves nothing** about this bug. Any experiment
-  aimed at it needs repetition, and any "fix" needs many runs before belief.
+The one part that still stands: a single passing run proves little. Repeat
+before believing.
 
-That last point retires an assumption worth naming: heavy new use of
-`hiprtBuildTraceKernels` (the whole custom-primitive path) did NOT meet this
-failure, which looked like evidence against the complexity hypothesis. Given
-nondeterminism, it is weak evidence at best.
+### 11n.1b The investigation before the fix (superseded, kept for the method)
 
-### 11n.1 The open bug: hiprtBuildTraceKernels on loop/vcall kernels
+What follows was the state of §11n.1 while it was open. The conclusions about
+the emitted source and about scene churn were correct; the framing was not. It
+is kept because the elimination sequence is reusable and because it shows how
+long a wrong frame can survive good individual experiments.
 
-Every remaining crash in the Mitsuba suite on HIP has **one** root cause, and it
-is worth stating precisely because the surface symptoms look unrelated:
-`test_ad::test01_bsdf_reflectance_backward`, `test_aov::test06_..._ad_backward`,
-`test_ad_integrators::test01_rendering_primal`, `test_freeze`, and
-`test_mesh::test14` all die inside `jitc_hip_compile()`.
+Ruled out by experiment, each still valid:
 
-What is established:
+  * the emitted source (builds standalone, 60/60 with separate processes);
+  * scene churn (12 build/destroy cycles clean);
+  * kernel count and interleaving (8 distinct traced kernels clean);
+  * a missing CUDA context binding -- a REAL bug, found and fixed here, and the
+    crash survived it. Fixing something real is not evidence you fixed the thing
+    you were chasing;
+  * device memory exhaustion (5.6 GB of 6 GB free at the crash);
+  * NVRTC-first interaction, prior geometry, prior scene, 2 GiB held, repeated
+    builds, and the exact six-kernel sequence replayed standalone -- all clean.
 
-- The failure is `hiprtBuildTraceKernels()` returning **`hiprtErrorInternal`
-  (2)**, or segfaulting *inside itself* — the faulthandler trace names
-  `libhiprt0300064.so` frames beneath `hiprtBuildTraceKernels`. So HIP-RT's own
-  builder is the thing failing, not our emitted text being rejected by a
-  compiler that then reports a diagnostic. **No compiler diagnostic is ever
-  printed**, which is §7b's "fails late and unhelpfully" exactly.
-- It is **not** cumulative resource exhaustion. A loop building and destroying
-  12 scenes, tracing each, is clean. Eight *distinct* traced kernels in one
-  process are clean.
-- It **is** specific to kernels that contain a trace **and** come from
-  `ad_loop()` (a symbolic loop) or `jit_var_call_reduce()` (a vcall). Those are
-  exactly the kernels a real integrator generates, which is why a direct
-  `ray_intersect_preliminary` renders perfectly (1.19e-07 vs LLVM) while
-  `mi.render()` through the path integrator does not.
-- `test_mesh::test14` needs `test13` to have run first; run alone it passes. So
-  some cross-test state changes which kernel is generated, not whether the bug
-  exists.
-
-**The emitted source is VALID — the emitter is no longer a suspect.** The exact
-kernel drjit-core logs on failure was extracted and rebuilt standalone through
-`hiprtBuildTraceKernels()` with argument-for-argument identical parameters
-(`scratchpad/rtbuild.cpp`): **it succeeds**. Same text, same options, same
-`numGeomTypes`/`funcNameSets`, fresh process. So this is not a codegen bug, and
-"kernels from symbolic loops and vcalls are miscompiled" — which is what the
-symptom looked like — is the wrong description. The cause is **process state**.
-
-Eliminated so far, each by direct experiment rather than reasoning:
-
-| Hypothesis | Test | Result |
-|---|---|---|
-| Invalid emitted HIP | rebuild the logged source standalone | **builds fine** |
-| Cumulative scene churn | 12 build/destroy cycles + trace | clean |
-| Many distinct kernels | 8 distinct traced kernels | clean |
-| Scenes interleaved with distinct kernels | 8 of each, alternating | clean |
-| Missing CUDA context binding | added `scoped_set_context` (a real bug, committed) | **still crashes** |
-| Device memory exhaustion | `nvidia-smi` trace during the failing run | **5.6 GB of 6 GB free at crash** |
-
-**Working assessment: a probable shim artifact, not yet proven.** What remains
-is HIP-RT-on-CUDA through Orochi — the least-travelled path in the stack, and
-the one AMD does not test. Against that, `hiprtBuildTraceKernels()` *is* the API
-real hardware compiles through (§7a), so this cannot be dismissed. It is
-deliberately parked rather than closed: the honest position is that we do not
-know, and finding out costs less on an MI210 than it does here.
-
-**If you pick this up, the next probes are:** build the same kernel twice
-against one `hiprtContext` in `rtbuild.cpp` (tests repeat-build in one context,
-which the in-process case does and the standalone case does not); and bisect
-`test13` to find which of its operations arms the failure, since `test14` alone
-passes.
+The last group is what finally forced the question "if not the source, the
+arguments, or the state, then WHERE is it failing?" -- which the BEGIN/END
+markers answered in one run.
 
 ## 11o. Custom primitives — the half that is built, and the half that is not
 

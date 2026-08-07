@@ -541,6 +541,17 @@ uint32_t jitc_hip_isect_geom_types() {
     return (uint32_t) jitc_hip_isect_names.size();
 }
 
+/// $DRJIT_HIP_DUMP_RT_SRC: dump every source handed to hiprtBuildTraceKernels
+/// into that directory, with a BEGIN/END trace in order.txt.
+///
+/// Kept because of how §11n.1 was finally cornered. HIP-RT reports a build
+/// failure two ways -- returning hiprtErrorInternal, or faulting inside the
+/// call -- and only the first ever reached a log, so the source of the second
+/// had never been seen. A dangling BEGIN with no END is what proves the fault
+/// is INSIDE a given build rather than after it.
+static const char *jitc_hip_dump_dir = nullptr;
+static char jitc_hip_dump_path[512];
+
 static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
                                                         const char *name) {
     if (!jitc_hip_shim_rt_init())
@@ -612,13 +623,58 @@ static std::pair<void *, bool> jitc_hip_shim_rt_compile(const char *source,
         }
     }
 
+    // The failure that merely RETURNS an error logs its source below; the one
+    // that faults inside the call logs nothing. Dumping before the call covers
+    // both -- see jitc_hip_dump_dir.
+    if (const char *dump = getenv("DRJIT_HIP_DUMP_RT_SRC")) {
+        static int seq = 0;
+        char *path = jitc_hip_dump_path;
+        snprintf(path, sizeof(jitc_hip_dump_path), "%s/rtsrc_%04d_%s.hip", dump, seq++, name);
+        if (FILE *f = fopen(path, "w")) {
+            fwrite(build_src, 1, strlen(build_src), f);
+            fclose(f);
+        }
+        // BEGIN before / END after, each fflush'd and fsync'd. A segfault
+        // inside the call leaves a dangling BEGIN, which is the only way to
+        // tell "crashed inside this build" from "crashed after it".
+        FILE *l = fopen((std::string(dump) + "/order.txt").c_str(), "a");
+        if (l) { fprintf(l, "BEGIN %s\n", path); fflush(l); fclose(l); }
+        jitc_hip_dump_dir = dump;
+    }
+
+    // THE MODULE NAME MUST BE UNIQUE PER BUILD. This is the §11n.1 fix.
+    //
+    // drjit-core names a kernel by its source hash, so compiling the same
+    // kernel twice in one process presents HIP-RT with the same name twice.
+    // moduleName is HIP-RT's own bookkeeping key, and the second build then
+    // reaches cuModuleGetFunction with a module handle that is no longer valid:
+    //
+    //   hiprtBuildTraceKernels -> Compiler::buildKernels
+    //     -> oroModuleGetFunction -> cuModuleGetFunction -> SIGSEGV
+    //
+    // It presents two ways -- a bare hiprtErrorInternal, or a fault inside the
+    // call -- which is why it looked random for two sessions. It is not:
+    // occurrence is deterministic per kernel, only the manifestation varies.
+    //
+    // The name is independent of the FUNCTION name, which must keep matching
+    // the __global__ symbol in the source, so only this argument changes.
+    static uint32_t build_seq = 0;
+    std::string module_name = std::string(name) + "_m" + std::to_string(build_seq++);
+
     hiprtError rv = hiprtBuildTraceKernels(
-        jitc_hiprt_ctx, 1, names, build_src, name,
+        jitc_hiprt_ctx, 1, names, build_src, module_name.c_str(),
         /* numHeaders = */ 0, nullptr, nullptr,
         (uint32_t) opts.size(), opts.data(),
         n_geom_types, /* numRayTypes = */ n_geom_types ? 1u : 0u,
         fn_sets.empty() ? nullptr : fn_sets.data(),
         &func, &mod, /* cache = */ false);
+
+    if (jitc_hip_dump_dir) {
+        FILE *l = fopen((std::string(jitc_hip_dump_dir) + "/order.txt").c_str(), "a");
+        if (l) { fprintf(l, "END   %s rv=%d\n", jitc_hip_dump_path, (int) rv);
+                 fflush(l); fclose(l); }
+        jitc_hip_dump_dir = nullptr;
+    }
 
     if (rv != hiprtSuccess) {
         jitc_log(Warn, "jit_hip_compile(): generated source that HIP-RT failed "
