@@ -1308,6 +1308,156 @@ The general lesson: **when a stack trace and a marker disagree, believe the
 marker.** And when a bug resists, check that the artifact you have been
 reproducing against came from the failure you are actually chasing.
 
+### 11n.3 Frozen functions: the resource handles are not frozen INPUTS
+
+`test_freeze` on HIP: 64 pass, 115 fail with "created before recording was
+started, but it was not specified as an input variable". Two prerequisites are
+already fixed (§11n.1 commit): the scene owner handle is a UInt64 rather than a
+`VarType::Pointer`, and each resource pointer now has a real `dep[3]`. This is
+what remains.
+
+**The mechanism.** `RecordThreadState::launch()` resolves a resource parameter
+by pointer:
+
+```
+if (has_variable(ptr))              slot = get_variable(ptr);
+else if (resource_kind != Buffer)   jitc_raise("... not supplied as an input");
+```
+
+So a resource's pointer must be in the frozen function's input map. Mitsuba
+traverses only `HIPAccel::accel_handle`, whose data is the `HIPScene *`, while
+the four resource parameters carry the individual DEVICE addresses (scene,
+func table, geometry ids, user instance ids). No single traversed variable
+covers them.
+
+**Why Metal does not have this problem.** `jitc_metal_make_resource_handle()`
+maps the **MetalScene\*** as the backing and tags the handle with a
+`ResourceKind`, so every resource parameter carries the SAME pointer -- the one
+Mitsuba traverses -- and Metal's launch path recovers the real resource from
+`(owner, kind)`.
+
+**Two ways to close it, and why the obvious one is the harder one.**
+
+  (A) *Metal's design.* Point the handles' backing at the `HIPScene *` and
+      translate `(scene, kind)` into a device address at launch. Clean in
+      principle, awkward here: `jitc_var_resource_pointer()` makes the handle's
+      literal the backing's data, and `add_param()` passes that literal
+      straight through as the kernel parameter (eval.cpp ~486). HIP parameters
+      are plain device pointers, so the translation has to happen in the launch
+      path -- which under the shim is `CUDAThreadState::launch`, since
+      `HIPThreadState` IS `CUDAThreadState` (hip_ts.h:54). Backend-specific
+      behaviour in shared CUDA code is exactly what the shim makes hard to do
+      safely, and it cannot be tested on real hardware here.
+
+  (B) *Make the handles inputs.* Keep each handle's backing on its own device
+      pointer (as now), force the four handles to exist in
+      `jitc_hip_configure_scene()` rather than lazily in
+      `jitc_hip_ray_trace()`, expose them through something like
+      `jit_hip_scene_resource_handles(scene_index, uint32_t out[4])`, and have
+      `HIPAccel` traverse them alongside `accel_handle`. Then `has_variable()`
+      hits directly, no launch-path change, nothing shim-aliased is touched.
+
+**(B) is recommended** -- roughly 40 lines across drjit-core and
+`accel_hip.h` / `scene_hip.inl`, no shared-code risk, and testable here.
+(A) is the more faithful port but its correctness depends on a code path the
+shim cannot exercise, which is the wrong trade while there is no MI210.
+
+Verification is `test_freeze` on `hip_ad_rgb` (about 9 minutes); the number to
+beat is 64 passed / 115 failed.
+
+### 11n.4 OPEN: backward AD is wrong on HIP by ~1.3%, and it is not a tolerance
+
+`test_ad_integrators` on `hip_ad_rgb`: 191 passed, 17 failed. Triage, with each
+step's control:
+
+| step | result |
+|---|---|
+| each failure re-run ALONE | 7 of 16 pass -> those are cross-test interference |
+| the other 9 | reproducible in isolation; 7 of them are `test03_rendering_backward` |
+| same configs on LLVM | 208 / 208 pass -> HIP-specific |
+| same configs on CUDA, in isolation | **15 of 16 pass** |
+
+A representative failure is not a wild gradient -- it is a nearly-right one:
+
+```
+-> grad:     0.000630026
+-> grad_ref: 0.000621671        ~1.3% high
+```
+
+**The CUDA control is the one that matters, and it was reached late.** The
+obvious hypothesis was that backward AD accumulates through scatter-add, float
+addition is not associative, and a different atomic reduction order explains a
+small relative error -- i.e. "GPU differs from a CPU-tuned tolerance, not a
+bug". LLVM was the cheap control and it says only "HIP-specific"; it cannot
+test that hypothesis at all, because LLVM has no GPU atomics. CUDA does, on the
+SAME card under the shim, and it passes 15/16. The accumulation-order
+explanation is dead: this is a real defect in HIP's backward path.
+
+Lesson worth keeping: **choose the control that discriminates between your
+hypotheses, not the one that is cheapest to run.** The LLVM run was not wasted
+-- it narrowed things -- but it could never have answered the question actually
+asked, and reporting it as though it had would have been wrong.
+
+Where to look next: the backward pass differs from the forward pass mainly in
+scatter-reduce. `test02_rendering_forward` fails 1 of its configs in isolation
+against `test03_rendering_backward`'s 7. Start with HIP's scatter-add /
+`ReduceOp` emission and compare the generated code against CUDA's for one
+failing config -- both are available in this build, which makes a direct
+kernel-source diff possible.
+
+Caveat: the shim runs at warp_size 32, the MI210 at wave64. If the emitted
+reduction turns out to be correct here, wave width is the next suspect and only
+hardware settles it.
+
+### 11n.5 OPEN, and the biggest lead: HIP leaks state ACROSS tests
+
+Two failure clusters that looked unrelated are one bug.
+
+| observation | number |
+|---|---|
+| `test_renders` on `hip_ad_spectral`, whole file | 118 failed / 78 passed |
+| the same file on `llvm_ad_spectral` | **196 / 0** |
+| 10 of those failures re-run individually | **10 / 10 pass** |
+| `-k "hip_ad_spectral and bsdf_spheres"` alone | **96 / 0** |
+| `test_ad_integrators` failures re-run individually | 7 of 16 pass |
+
+So per-scene correctness is FINE. `hip_ad_spectral` renders these scenes
+correctly; something earlier in a long process poisons later tests, and it is
+HIP-specific -- LLVM runs the identical 196 in one process cleanly.
+
+**A hypothesis that was tested and DISPROVED**, recorded because it was
+plausible and because the measurement was cheap: that §11n.1's unique
+`moduleName` had traded a crash for a module leak (nothing reused, nothing
+unloaded, unbounded growth in a long run). Measured over a spectral run:
+
+```
+HIP-RT module builds:   120
+distinct kernel hashes: 120
+```
+
+One build per distinct kernel, no repeats. Drjit's kernel cache is doing its
+job and the unique names accumulate nothing beyond what the workload needs.
+The fix is not the leak.
+
+**Where to look next.** The poisoning test is somewhere in `test_renders`
+outside `bsdf_spheres` (which passes 96/0 in isolation). A bisect over the file
+-- halve the `-k` selection until one scene reliably breaks the next -- is the
+obvious next move and needs a fresh session rather than the tail of a long one.
+
+Candidates worth trying first, on the grounds that they touch process-global
+HIP state rather than per-scene state:
+
+  * scenes with custom geometry, which now call `jit_hip_set_isect_source()` --
+    a GLOBAL registration (hip_core.cpp) that persists across scenes;
+  * `instancing` and `various_shapes`, which exercise the expanded-instance
+    tables and the ID buffers;
+  * anything that triggers an accel REBUILD (`HIPAccel::rebuild()` does
+    release-then-init), since that is where scene-owned HIP-RT objects and
+    their cleanup callbacks interact.
+
+This is worth prioritising: one cause explains 118 spectral render failures and
+7 AD failures, and it is fully diagnosable on the shim.
+
 ### 11n.2 The shape-recovery table is indexed by the EXPANDED instance id
 
 `scene_hip.inl` built `offsets` with one entry per SceneIR instance; the device
